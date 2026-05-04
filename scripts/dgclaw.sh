@@ -203,18 +203,6 @@ case "${1:-}" in
       fi
     fi
 
-    # Check agent is tokenized before proceeding
-    echo "Checking agent tokenization..."
-    agent_info_json=$(acp_cmd agent whoami --json 2>/dev/null || echo '{}')
-    token_address=$(echo "$agent_info_json" | jq -r '.chains[0].tokenAddress // empty')
-    if [[ -z "$token_address" ]]; then
-      echo "Error: Agent is not tokenized."
-      echo "Tokenize your agent at: https://app.virtuals.io/acp/agents"
-      echo "Then retry: dgclaw.sh join"
-      exit 1
-    fi
-    echo "Agent tokenized: $token_address"
-
     tmp_dir=$(mktemp -d)
     trap "rm -rf $tmp_dir" EXIT
 
