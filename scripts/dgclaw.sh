@@ -38,13 +38,13 @@ fi
 
 # ---- Helper functions ----
 
-# Fund an ACP job once the provider posts its notification memo. Polls
-# `acp job history` and scans each memo's content for the trigger string —
-# default "Ready to register agent on leaderboard" (the memo dgclaw posts on
-# join_leaderboard jobs). When found, fires `client fund` once.
+# Fund an ACP job once the provider has posted its requirement memo.
+# Polls `acp job history` and triggers `client fund` when the job reaches
+# NEGOTIATION (legacy: "budget_set") — at that point the seller's pending
+# requirement memo exists and `payAndAcceptRequirement` (inside `client fund`)
+# can sign it. Short-circuits if already past funding.
 fund_acp_job() {
   local job_id="$1"
-  local trigger="${2:-Ready to register agent on leaderboard}"
   local max_attempts=40
   local sleep_between=3
   local attempt=0
@@ -64,45 +64,37 @@ fund_acp_job() {
         end')
 
     case "$phase" in
-      EVALUATION|evaluation|COMPLETED|completed)
+      TRANSACTION|transaction|funded|EVALUATION|evaluation|submitted|COMPLETED|completed)
         echo "  Job already past funding (phase: $phase), skipping fund"
         return 0
         ;;
-      FAILED|failed|REJECTED|rejected)
+      FAILED|failed|REJECTED|rejected|EXPIRED|expired)
         echo "Error: Job $job_id is in terminal state $phase — cannot fund"
         echo "$status_response" | jq . 2>/dev/null || echo "$status_response"
         return 1
         ;;
+      NEGOTIATION|negotiation|budget_set)
+        echo "  Provider posted requirement memo (phase: $phase) — funding..."
+        local output err_msg
+        output=$(acp_cmd client fund --job-id "$job_id" --json 2>&1 || true)
+        err_msg=$(echo "$output" | jq -r '.error // empty' 2>/dev/null || echo "")
+        if [[ -z "$err_msg" ]]; then
+          echo "  Funded successfully"
+          return 0
+        fi
+        echo "  Fund call failed: $err_msg — retrying in ${sleep_between}s..."
+        ;;
+      *)
+        echo "  Waiting for provider requirement memo (phase: $phase, attempt $attempt/$max_attempts)..."
+        ;;
     esac
-
-    # Look for the trigger string anywhere in any memo (content/message/etc).
-    local trigger_found
-    trigger_found=$(echo "$status_response" | jq --arg t "$trigger" '
-      (if type == "array" then .[0] else . end)
-      | .memoHistory // []
-      | [.. | strings | select(contains($t))]
-      | length > 0' 2>/dev/null || echo "false")
-
-    if [[ "$trigger_found" == "true" ]]; then
-      echo "  Provider memo posted (\"$trigger\") — funding..."
-      local output err_msg
-      output=$(acp_cmd client fund --job-id "$job_id" --json 2>&1 || true)
-      err_msg=$(echo "$output" | jq -r '.error // empty' 2>/dev/null || echo "")
-      if [[ -z "$err_msg" ]]; then
-        echo "  Funded successfully"
-        return 0
-      fi
-      echo "  Fund call failed: $err_msg — retrying in ${sleep_between}s..."
-    else
-      echo "  Waiting for provider memo (phase: $phase, attempt $attempt/$max_attempts)..."
-    fi
 
     sleep "$sleep_between"
   done
 
-  echo "Error: Timed out waiting for trigger memo on job $job_id after $max_attempts attempts"
+  echo "Error: Timed out waiting for fundable phase on job $job_id after $max_attempts attempts"
   echo "Last phase: $phase"
-  echo "Check memo content: acp job history --chain-id 8453 --job-id $job_id --json"
+  echo "Check job history: acp job history --chain-id 8453 --job-id $job_id --json"
   return 1
 }
 
