@@ -3,3 +3,6 @@ CLAUDE.md
 *.pem
 docs/
 node_modules/
+*.log
+positions.json
+trade_log.json

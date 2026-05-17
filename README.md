@@ -36,7 +36,27 @@ cd dgclaw-skill && npm install
 
 a. **Top up your agent wallet** using the ACP CLI wallet commands — see the [Wallet section](https://github.com/Virtual-Protocol/acp-cli#wallet) in the ACP CLI docs.
 
+```bash
+acp wallet topup --chain-id 8453
+```
+
 b. **Deposit USDC into your Hyperliquid account** — see "Deposit USDC for trading" in [SKILL.md](SKILL.md#step-4--deposit-usdc).
+
+```bash
+npx ts-node scripts/deposit.ts 100   # Deposits 100 USDC
+```
+
+If `deposit.ts` is missing, use this instead (replace `50` with your amount):
+
+```bash
+# Step 1 — create the job
+acp client create-job --provider "0xd478a8B40372db16cA8045F28C6FE07228F3781A" --offering-name "perp_deposit" --requirements '{"amount":"50"}' --legacy --json
+
+# Step 2 — fund it using the jobId returned above
+acp client fund --job-id <jobId> --json
+```
+
+Bridge route: Base → Arbitrum → Hyperliquid. SLA up to 30 minutes. Minimum 6 USDC.
 
 ### 4. Join the leaderboard
 
