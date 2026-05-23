@@ -5,9 +5,9 @@ import { HttpTransport, ExchangeClient, InfoClient } from '@nktkas/hyperliquid';
 
 const HL_API_URL = 'https://api.hyperliquid.xyz';
 const MARGIN_PER_TRADE_USD = 10; // your capital at risk per trade (before leverage)
-const LEVERAGE_LOW = 3;          // OI $500K–$10M  (~$50M–$300M mcap)
-const LEVERAGE_HIGH = 5;         // OI $10M–$30M   (~$300M–$500M mcap)
-const OI_LEVERAGE_THRESHOLD = 10_000_000;
+const LEVERAGE_LOW = 3;          // OI $500K–$5M
+const LEVERAGE_HIGH = 5;         // OI $5M–$30M
+const OI_LEVERAGE_THRESHOLD = 5_000_000;
 const MAX_POSITIONS = 5;
 const MIN_SL_PCT = 0.06; // if candle-based SL is too tight, widen to at least 6%
 const MAX_SL_PCT = 0.12; // skip trade if dynamic SL is more than 12% from entry
@@ -73,7 +73,7 @@ interface Candle {
 interface SignalResult {
   symbol: string;
   direction: 'long' | 'short';
-  score: number; // 0–100 continuous strength score
+  score: number;
   signals: Record<string, boolean>;
   midPrice: number;
   rsi: number;
@@ -83,7 +83,9 @@ interface SignalResult {
   slPrice: number;
   candleMovePct: number;
   oiUsd: number;
-  leverage: number; // 3x for OI <$10M, 5x for OI >=$10M
+  leverage: number;
+  lastClose: number;
+  ma50: number | null;
 }
 
 async function hlPost(body: object): Promise<any> {
@@ -259,8 +261,8 @@ async function analyzeAsset(
     const shortScore = calcStrengthScore('short', lastRSI, obvRisingCount, bullishEngulfing, bearishEngulfing, bothGreen, bothRed, vwap, lastClose, volumeBuildRatio, ma50, ma200, goldenCross, deathCross);
 
     return {
-      long: { symbol, direction: 'long', score: longScore, signals: longBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: longSLPrice, candleMovePct, oiUsd, leverage },
-      short: { symbol, direction: 'short', score: shortScore, signals: shortBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: shortSLPrice, candleMovePct, oiUsd, leverage },
+      long: { symbol, direction: 'long', score: longScore, signals: longBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: longSLPrice, candleMovePct, oiUsd, leverage, lastClose, ma50 },
+      short: { symbol, direction: 'short', score: shortScore, signals: shortBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: shortSLPrice, candleMovePct, oiUsd, leverage, lastClose, ma50 },
     };
   } catch {
     return { long: null, short: null };
@@ -494,8 +496,8 @@ async function checkStalePositions(
 
         if (Date.now() >= nextCheckTime) {
           const unrealizedPnl = parseFloat((pos as any).unrealizedPnl ?? '0');
-          if (unrealizedPnl > 0) {
-            console.log(`${tracked.symbol}: ${ageH}h old — 8h profit check — in profit ($${unrealizedPnl.toFixed(2)}) — closing`);
+          if (unrealizedPnl >= 3) {
+            console.log(`${tracked.symbol}: ${ageH}h old — 8h profit check — in profit ($${unrealizedPnl.toFixed(2)} ≥ $3) — closing`);
             try {
               const openOrders = await info.openOrders({ user: masterAddress as `0x${string}` });
               const tpslOrders = (openOrders as any[]).filter(o => o.coin?.toUpperCase() === tracked.symbol.toUpperCase());
@@ -525,7 +527,7 @@ async function checkStalePositions(
               }
             }
           } else {
-            console.log(`${tracked.symbol}: ${ageH}h old — 8h profit check — not in profit ($${unrealizedPnl.toFixed(2)}) — holding`);
+            console.log(`${tracked.symbol}: ${ageH}h old — 8h profit check — below $3 threshold ($${unrealizedPnl.toFixed(2)}) — holding`);
             tracked.lastProfitCheckTime = nextCheckTime;
             remaining.push(tracked);
           }
@@ -659,7 +661,7 @@ async function main() {
 
   const slotsAvailable = dryRun ? MAX_POSITIONS : MAX_POSITIONS - openPositions.length;
 
-  // OBV + candle mandatory; RSI now scoring only (0–30 pts); minimum score gate = 45
+  // OBV + candle mandatory; RSI scoring only; 50 MA hard directional gate; min score = 45
   const MIN_ENTRY_SCORE = 45;
   const seen = new Set<string>();
   const eligible = allResults.filter(r => {
@@ -667,6 +669,11 @@ async function main() {
     if (!r.signals.obv) return false;
     if (!r.signals[candleSignal] && !r.signals.engulfing) return false;
     if (r.score < MIN_ENTRY_SCORE) return false;
+    // 50 MA hard gate: no longs below 50 MA, no shorts above 50 MA
+    if (r.ma50 !== null) {
+      if (r.direction === 'long' && r.lastClose < r.ma50) return false;
+      if (r.direction === 'short' && r.lastClose > r.ma50) return false;
+    }
     if (openCoins.has(r.symbol.toUpperCase())) return false;
     if (seen.has(r.symbol)) return false;
     seen.add(r.symbol);
@@ -682,7 +689,7 @@ async function main() {
   }
 
   if (eligible.length === 0) {
-    console.log(`\nNo asset met entry criteria (OBV+candle mandatory, score≥${MIN_ENTRY_SCORE}) — no trade`);
+    console.log(`\nNo asset met entry criteria (OBV+candle mandatory, 50 MA gate, score≥${MIN_ENTRY_SCORE}) — no trade`);
     return;
   }
 
