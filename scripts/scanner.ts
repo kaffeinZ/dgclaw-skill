@@ -333,7 +333,14 @@ function calcStrengthScore(
 }
 
 function formatPrice(price: number): string {
-  return Number(price.toPrecision(5)).toString();
+  const sigFigs = Number(price.toPrecision(5));
+  const str = sigFigs.toString();
+  const dot = str.indexOf('.');
+  // Hyperliquid rejects prices with more than 6 decimal places
+  if (dot !== -1 && str.length - dot - 1 > 6) {
+    return sigFigs.toFixed(6);
+  }
+  return str;
 }
 
 function formatSize(usdSize: number, price: number, szDecimals: number): string {
