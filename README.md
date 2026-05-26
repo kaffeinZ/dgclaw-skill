@@ -96,6 +96,49 @@ skills:
       - /path/to/dgclaw-skill
 ```
 
+## Automated Scanner
+
+The scanner (`scripts/scanner.ts`) runs every 15 minutes, scans all Hyperliquid perp assets within the OI range ($0.5M–$30M, majors excluded), and opens up to 5 concurrent positions.
+
+### Entry criteria (all must pass)
+
+1. **OBV rising** — at least 3 of the last 5 OBV steps must be rising (hard gate, not scored)
+2. **Candle direction** — 2 consecutive green candles (long) or 2 consecutive red candles (short) on the 15m chart (hard gate, not scored)
+3. **MA50 directional gate** — no longs below the 50-period MA, no shorts above it (hard gate, not scored)
+4. **Minimum score ≥ 45** — from the scoring system below
+
+### Scoring system (max ~85 pts)
+
+| Component | Max pts | How it scores |
+|-----------|---------|---------------|
+| RSI | 15 | `15 - abs(RSI - 30) × 0.5` for longs (peaks at RSI=30); `15 - abs(RSI - 70) × 0.5` for shorts. RSI must have been oversold (<30) / overbought (>70) within the last 8 candles (2h). |
+| OBV strength | 15 | 0pts at 1/5 rising, 7.5pts at 3/5, 15pts at 5/5. Rewards strong buying/selling pressure. |
+| Candle pattern | 10–15 | 10pts for 2 same-direction candles (the entry requirement). +5pts bonus (15 total) if a bullish/bearish engulfing pattern also fires. |
+| Price vs VWAP | 15 | Longs: price below VWAP scores up to 15pts (3% below = max). Shorts: price above VWAP. Rewards mean-reversion entries. |
+| Volume build | 15 | Recent 3-candle avg vs prior 3-candle avg. Needs 3× volume ratio to max out. |
+| MA50 > MA200 | +5 | Bonus when the 50 MA is above the 200 MA (bull trend for longs) or below (bear trend for shorts). |
+| Golden/death cross | +10 | Bonus when the 50 MA just crossed the 200 MA in the signal direction. |
+
+**Max possible: 85 pts** (75 from core signals + 10 cross bonus). A typical qualifying entry scores 45–55.
+
+> The MA distance from the 50/200 MA is intentionally NOT scored — being far above an MA conflicts with the RSI-near-30 oversold premise. The MA50 gate enforces trend direction; scoring rewards the entry quality.
+
+### Exit logic
+
+| Exit type | Condition |
+|-----------|-----------|
+| TP / SL | Set at entry: TP = 2× SL distance from fill price, SL = candle low/high ± 0.5% buffer (min 6%, max 12%) |
+| 8h profit | At every 8h boundary: if unrealised PnL ≥ $3, close immediately |
+| 16h loss | At the 16h mark: if unrealised PnL < $0 (below breakeven), close immediately — cuts slow bleeds before the 24h hard exit |
+| 24h hard exit | Closes any remaining position at 24h regardless of PnL |
+
+### Asset universe filters
+
+- OI range: $500K–$30M (mid-tier alts — liquid enough to exit, volatile enough for moves)
+- Majors excluded: BTC, ETH, SOL, BNB, XRP, ADA, DOGE, etc.
+- Leverage: 3× (OI $500K–$5M) or 5× (OI $5M–$30M)
+- Margin per trade: $10 | Max concurrent positions: 5
+
 ## License
 
 MIT

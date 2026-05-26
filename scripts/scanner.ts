@@ -47,7 +47,7 @@ interface TradeLogEntry {
   direction: 'long' | 'short';
   openTime: number;
   closeTime: number;
-  closeReason: 'tp_or_sl' | '24h' | '8h_profit';
+  closeReason: 'tp_or_sl' | '24h' | '8h_profit' | '16h_loss';
   pnlUsd: number | null; // null for external tp/sl closes
   entrySignal: string;
 }
@@ -319,24 +319,6 @@ function calcStrengthScore(
   // Volume build (0–15 pts)
   score += Math.min(15, Math.max(0, (volumeBuildRatio - 1.0) * 7.5));
 
-  // 50 MA trend alignment (0–15 pts): 5% on right side = max pts
-  if (ma50 !== null) {
-    if (direction === 'long' && lastClose > ma50) {
-      score += Math.min(15, ((lastClose - ma50) / ma50) * 300);
-    } else if (direction === 'short' && lastClose < ma50) {
-      score += Math.min(15, ((ma50 - lastClose) / ma50) * 300);
-    }
-  }
-
-  // 200 MA alignment (0–15 pts)
-  if (ma200 !== null) {
-    if (direction === 'long' && lastClose > ma200) {
-      score += Math.min(15, ((lastClose - ma200) / ma200) * 300);
-    } else if (direction === 'short' && lastClose < ma200) {
-      score += Math.min(15, ((ma200 - lastClose) / ma200) * 300);
-    }
-  }
-
   // 50/200 double confirmation (+5 pts bonus)
   if (ma50 !== null && ma200 !== null) {
     if (direction === 'long' && ma50 > ma200) score += 5;
@@ -449,8 +431,21 @@ async function checkStalePositions(
     try {
       const pos = openMap.get(tracked.symbol.toUpperCase());
       if (!pos) {
-        console.log(`${tracked.symbol}: closed externally (TP/SL hit) — removing from state`);
-        logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: 'tp_or_sl', pnlUsd: null, entrySignal: tracked.entrySignal ?? 'unknown' });
+        let realizedPnl: number | null = null;
+        try {
+          const fills = await info.userFillsByTime({ user: masterAddress as `0x${string}`, startTime: tracked.openTime });
+          const coinFills = (fills as any[]).filter(f =>
+            f.coin?.toUpperCase() === tracked.symbol.toUpperCase() &&
+            f.time >= tracked.openTime,
+          );
+          if (coinFills.length > 0) {
+            realizedPnl = coinFills.reduce((sum: number, f: any) => sum + parseFloat(f.closedPnl ?? '0'), 0);
+          }
+        } catch {
+          // ignore — pnlUsd stays null
+        }
+        console.log(`${tracked.symbol}: closed externally (TP/SL hit) — PnL: ${realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown'}`);
+        logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: 'tp_or_sl', pnlUsd: realizedPnl, entrySignal: tracked.entrySignal ?? 'unknown' });
         continue;
       }
 
@@ -523,6 +518,36 @@ async function checkStalePositions(
                 logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: '8h_profit', pnlUsd: unrealizedPnl, entrySignal: tracked.entrySignal ?? 'unknown' });
               } else {
                 console.error(`  ${tracked.symbol}: close order did not fill — keeping in state, will retry`);
+                remaining.push(tracked);
+              }
+            }
+          } else if (ageMs >= 16 * 60 * 60 * 1000 && unrealizedPnl < 0) {
+            console.log(`${tracked.symbol}: ${ageH}h old — 16h loss exit — below breakeven ($${unrealizedPnl.toFixed(2)}) — closing`);
+            try {
+              const openOrders = await info.openOrders({ user: masterAddress as `0x${string}` });
+              const tpslOrders = (openOrders as any[]).filter(o => o.coin?.toUpperCase() === tracked.symbol.toUpperCase());
+              for (const o of tpslOrders) {
+                await exchange.cancel({ cancels: [{ a: tracked.assetIndex, o: o.oid }] });
+              }
+            } catch { /* ignore cancel errors */ }
+
+            const sz16 = Math.abs(parseFloat(pos.szi)).toString();
+            const isLong16 = parseFloat(pos.szi) > 0;
+            const midPrice16 = parseFloat(mids[tracked.symbol] ?? '0');
+            if (!midPrice16) {
+              console.error(`  ${tracked.symbol}: mid price unavailable — skipping 16h close, will retry next scan`);
+              remaining.push(tracked);
+            } else {
+              const closePrice16 = formatPrice(midPrice16 * (isLong16 ? 0.99 : 1.01));
+              const result16 = await exchange.order({
+                orders: [{ a: tracked.assetIndex, b: !isLong16, r: true, p: closePrice16, s: sz16, t: { limit: { tif: 'Ioc' } } }],
+                grouping: 'na',
+              });
+              console.log(`  Close result:`, JSON.stringify(result16, null, 2));
+              if (extractFilledOrder(result16)) {
+                logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: '16h_loss', pnlUsd: unrealizedPnl, entrySignal: tracked.entrySignal ?? 'unknown' });
+              } else {
+                console.error(`  ${tracked.symbol}: 16h close order did not fill — keeping in state, will retry`);
                 remaining.push(tracked);
               }
             }
@@ -667,7 +692,7 @@ async function main() {
   const eligible = allResults.filter(r => {
     const candleSignal = r.direction === 'long' ? 'greenCandles' : 'redCandles';
     if (!r.signals.obv) return false;
-    if (!r.signals[candleSignal] && !r.signals.engulfing) return false;
+    if (!r.signals[candleSignal]) return false;
     if (r.score < MIN_ENTRY_SCORE) return false;
     // 50 MA hard gate: no longs below 50 MA, no shorts above 50 MA
     if (r.ma50 !== null) {
