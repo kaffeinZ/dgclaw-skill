@@ -105,23 +105,24 @@ The scanner (`scripts/scanner.ts`) runs every 15 minutes, scans all Hyperliquid 
 1. **OBV rising** — at least 3 of the last 5 OBV steps must be rising (hard gate, not scored)
 2. **Candle direction** — 2 consecutive green candles (long) or 2 consecutive red candles (short) on the 15m chart (hard gate, not scored)
 3. **MA50 directional gate** — no longs below the 50-period MA, no shorts above it (hard gate, not scored)
-4. **Minimum score ≥ 45** — from the scoring system below
+4. **RSI hard gate** — longs blocked if RSI > 75 (extremely overbought); shorts blocked if RSI < 25 (extremely oversold). Prevents counter-trend disaster entries.
+5. **Minimum score ≥ 45** — from the scoring system below
 
-### Scoring system (max ~85 pts)
+### Scoring system (max ~95 pts)
 
 | Component | Max pts | How it scores |
 |-----------|---------|---------------|
-| RSI | 15 | `15 - abs(RSI - 30) × 0.5` for longs (peaks at RSI=30); `15 - abs(RSI - 70) × 0.5` for shorts. RSI must have been oversold (<30) / overbought (>70) within the last 8 candles (2h). |
+| RSI | 15 | Longs: `15 - abs(RSI - 45) × 0.4` — peaks at RSI=45 (15pts), still 9pts at RSI=30 or RSI=60, tapering to 0 near extremes. Shorts: `15 - abs(RSI - 55) × 0.4` — peaks at RSI=55. Rewards both oversold bounces and healthy momentum entries in either direction. |
 | OBV strength | 15 | 0pts at 1/5 rising, 7.5pts at 3/5, 15pts at 5/5. Rewards strong buying/selling pressure. |
-| Candle pattern | 10–15 | 10pts for 2 same-direction candles (the entry requirement). +5pts bonus (15 total) if a bullish/bearish engulfing pattern also fires. |
-| Price vs VWAP | 15 | Longs: price below VWAP scores up to 15pts (3% below = max). Shorts: price above VWAP. Rewards mean-reversion entries. |
-| Volume build | 15 | Recent 3-candle avg vs prior 3-candle avg. Needs 3× volume ratio to max out. |
+| Candle pattern | 10–15 | 10pts for 2 same-direction candles (the entry requirement). +5pts bonus (15 total) if a bullish/bearish engulfing pattern also coincides. Engulfing alone cannot trigger entry. |
+| Price vs VWAP | 15 | Symmetric: price AT VWAP = 15pts. For longs: within 5% above VWAP still scores (rewards pullback entries in a pump); beyond 5% above = 0pts. For shorts: mirror. No longer penalises longs just because the market is trending up. |
+| Volume build | **20** | Recent 3-candle avg vs prior 3-candle avg. **Strongest win predictor** — raised from 15pts. Needs 3× ratio to max out. LDO loss (vol 0.96x) scores 0; kBONK win (vol 25x) scores 20. |
 | MA50 > MA200 | +5 | Bonus when the 50 MA is above the 200 MA (bull trend for longs) or below (bear trend for shorts). |
 | Golden/death cross | +10 | Bonus when the 50 MA just crossed the 200 MA in the signal direction. |
 
-**Max possible: 85 pts** (75 from core signals + 10 cross bonus). A typical qualifying entry scores 45–55.
+**Max possible: 95 pts** (80 from core signals + 15 bonuses). A typical qualifying entry scores 45–60.
 
-> The MA distance from the 50/200 MA is intentionally NOT scored — being far above an MA conflicts with the RSI-near-30 oversold premise. The MA50 gate enforces trend direction; scoring rewards the entry quality.
+> **What changed and why (2026-05-29):** RSI peaks shifted from 30/70 to 45/55 — trade analysis showed wins clustered at RSI 40–65, not at the extremes. VWAP scoring made symmetric so longs aren't penalised during market pumps. Volume raised to 20pts as it was the clearest differentiator between wins (≥2×) and losses (<1×). RSI hard gates added after two -$3 losses: VINE long at RSI 78.9 and VIRTUAL short at RSI 17.7.
 
 ### Exit logic
 

@@ -240,16 +240,16 @@ async function analyzeAsset(
     const deathCross  = (ma50 !== null && ma200 !== null && prevMa50 !== null && prevMa200 !== null && prevMa50 >= prevMa200 && ma50 < ma200);
 
     const longBase: Record<string, boolean> = {
-      rsi: lastRSI >= 30 && rsiWasOversold,
+      rsi: lastRSI >= 30 && lastRSI <= 65,
       obv: obvRising,
-      priceVsVwap: vwap > 0 && lastClose <= vwap * 1.02,
+      priceVsVwap: vwap > 0 && lastClose <= vwap * 1.05,
       greenCandles: bothGreen,
       engulfing: bullishEngulfing,
     };
     const shortBase: Record<string, boolean> = {
-      rsi: lastRSI <= 70 && rsiWasOverbought,
+      rsi: lastRSI >= 35 && lastRSI <= 70,
       obv: !obvRising,
-      priceVsVwap: vwap > 0 && lastClose >= vwap,
+      priceVsVwap: vwap > 0 && lastClose >= vwap * 0.95,
       redCandles: bothRed,
       engulfing: bearishEngulfing,
     };
@@ -287,11 +287,12 @@ function calcStrengthScore(
 ): number {
   let score = 0;
 
-  // RSI proximity (0–15 pts): peak at RSI=30 (long) / RSI=70 (short), tapers off either side
+  // RSI proximity (0–15 pts): peak at RSI=45 (long) / RSI=55 (short) — rewards both oversold
+  // bounces and healthy momentum entries; tapers smoothly toward extremes.
   if (direction === 'long') {
-    score += Math.max(0, Math.min(15, 15 - Math.abs(rsi - 30) * 0.5));
+    score += Math.max(0, Math.min(15, 15 - Math.abs(rsi - 45) * 0.4));
   } else {
-    score += Math.max(0, Math.min(15, 15 - Math.abs(rsi - 70) * 0.5));
+    score += Math.max(0, Math.min(15, 15 - Math.abs(rsi - 55) * 0.4));
   }
 
   // OBV (0–15 pts): 3.75 pts at 3/5, 11.25 pts at 4/5, 15 pts at 5/5
@@ -307,17 +308,19 @@ function calcStrengthScore(
     else if (bothRed) score += 10;
   }
 
-  // Price vs VWAP (0–15 pts)
+  // Price vs VWAP (0–15 pts): symmetric — rewards entries within 5% of VWAP on either side.
+  // Price AT VWAP = 15pts (ideal pullback). Extended >5% above/below = 0pts.
   if (vwap > 0) {
+    const vwapDist = (lastClose - vwap) / vwap;
     if (direction === 'long') {
-      score += Math.min(15, Math.max(0, ((vwap - lastClose) / vwap) * 500));
+      score += Math.min(15, Math.max(0, (0.05 - vwapDist) * 300));
     } else {
-      score += Math.min(15, Math.max(0, ((lastClose - vwap) / vwap) * 500));
+      score += Math.min(15, Math.max(0, (vwapDist + 0.05) * 300));
     }
   }
 
-  // Volume build (0–15 pts)
-  score += Math.min(15, Math.max(0, (volumeBuildRatio - 1.0) * 7.5));
+  // Volume build (0–20 pts): strongest win predictor. Needs 3× ratio to max out.
+  score += Math.min(20, Math.max(0, (volumeBuildRatio - 1.0) * 10));
 
   // 50/200 double confirmation (+5 pts bonus)
   if (ma50 !== null && ma200 !== null) {
@@ -701,6 +704,9 @@ async function main() {
     if (!r.signals.obv) return false;
     if (!r.signals[candleSignal]) return false;
     if (r.score < MIN_ENTRY_SCORE) return false;
+    // RSI hard gates: block extreme overbought longs and extreme oversold shorts
+    if (r.direction === 'long'  && r.rsi > 75) return false;
+    if (r.direction === 'short' && r.rsi < 25) return false;
     // 50 MA hard gate: no longs below 50 MA, no shorts above 50 MA
     if (r.ma50 !== null) {
       if (r.direction === 'long' && r.lastClose < r.ma50) return false;
