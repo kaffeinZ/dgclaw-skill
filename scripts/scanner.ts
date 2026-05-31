@@ -24,6 +24,10 @@ const STATE_FILE = new URL('../positions.json', import.meta.url).pathname;
 const TRADE_LOG_FILE = new URL('../trade_log.json', import.meta.url).pathname;
 const LOCK_FILE = new URL('../.scanner.lock', import.meta.url).pathname;
 
+const FORUM_BASE = 'https://degen.virtuals.io';
+const FORUM_AGENT_ID = '1026';
+const FORUM_SIGNALS_THREAD = '1024';
+
 const MAJORS = new Set([
   'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'LTC',
   'AVAX', 'DOT', 'MATIC', 'POL', 'TRX', 'LINK', 'ATOM', 'UNI',
@@ -421,6 +425,29 @@ function logTrade(entry: TradeLogEntry): void {
   fs.writeFileSync(TRADE_LOG_FILE, JSON.stringify(log, null, 2));
 }
 
+async function postToForum(title: string, content: string): Promise<void> {
+  const apiKey = process.env.DGCLAW_API_KEY;
+  if (!apiKey) {
+    console.log('FORUM: DGCLAW_API_KEY not set — skipping post');
+    return;
+  }
+  try {
+    const res = await fetch(`${FORUM_BASE}/api/forums/${FORUM_AGENT_ID}/threads/${FORUM_SIGNALS_THREAD}/posts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify({ title, content }),
+    });
+    if (res.ok) {
+      console.log(`FORUM: posted "${title}"`);
+    } else {
+      const text = await res.text();
+      console.error(`FORUM: post failed ${res.status} — ${text.slice(0, 120)}`);
+    }
+  } catch (e: any) {
+    console.error(`FORUM: post error — ${e.message}`);
+  }
+}
+
 async function getReversalScore(symbol: string, direction: 'long' | 'short'): Promise<number> {
   try {
     const now = Date.now();
@@ -510,6 +537,12 @@ async function checkStalePositions(
         }
         console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=SL_hit | PnL=${realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown'} | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'} | entryScore=${tracked.entryScore ?? '?'}`);
         logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: 'tp_or_sl', pnlUsd: realizedPnl, entrySignal: tracked.entrySignal ?? 'unknown' });
+        const heldH = ((Date.now() - tracked.openTime) / 3_600_000).toFixed(1);
+        const slPnlStr = realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown';
+        postToForum(
+          `Closed ${tracked.symbol} ${tracked.direction} — ${realizedPnl !== null && realizedPnl >= 0 ? '+' : ''}${slPnlStr} | SL hit`,
+          `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — Stop Loss hit**\n\n**PnL:** ${slPnlStr}\n**Held:** ${heldH}h\n**Entry:** ${tracked.entryPrice ?? '?'} | **SL:** ${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'}\n**Entry score:** ${tracked.entryScore ?? '?'}/100\n\nStop loss triggered. Price moved against the entry thesis.`
+        ).catch(() => {});
         continue;
       }
 
@@ -524,6 +557,10 @@ async function checkStalePositions(
         if (reversalScore > tracked.entryScore) {
           const unrealizedPnl = parseFloat((pos as any).unrealizedPnl ?? '0');
           console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=signal_reversal | PnL=$${unrealizedPnl.toFixed(4)} | entryScore=${tracked.entryScore} | reversalScore=${reversalScore} (${oppositeDir}) | held=${ageH}h | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'}`);
+          postToForum(
+            `Closed ${tracked.symbol} ${tracked.direction} — ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Signal reversal`,
+            `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — Signal reversal**\n\n**PnL:** ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)}\n**Held:** ${ageH}h\n**Entry score:** ${tracked.entryScore}/100\n**Reversal score:** ${reversalScore}/100 (${oppositeDir} signal)\n**Entry:** ${tracked.entryPrice ?? '?'}\n\nOpposing ${oppositeDir} signal scored ${reversalScore} vs entry score ${tracked.entryScore} — market momentum reversed, exiting before SL.`
+          ).catch(() => {});
           try {
             const openOrders = await info.openOrders({ user: masterAddress as `0x${string}` });
             const slOrders = (openOrders as any[]).filter(o =>
@@ -926,6 +963,17 @@ async function main() {
         continue;
       }
       console.log(`SL set: ${slPrice}`);
+
+      // Forum post — entry rationale
+      const maDesc = best.ma50 !== null && best.ma200 !== null
+        ? (best.ma50 > best.ma200 ? 'bullish (MA50 > MA200)' : 'bearish (MA50 < MA200)')
+        : 'unknown';
+      const vwapDesc = best.vwap > 0 ? `${((best.lastClose - best.vwap) / best.vwap * 100).toFixed(1)}% from VWAP` : '';
+      const signalList = Object.entries(best.signals).filter(([, v]) => v).map(([k]) => k).join(', ');
+      const crossNote = best.isCross ? `\n- **Golden/Death Cross**: yes — priority entry, overrides normal gates` : '';
+      const entryTitle = `${best.direction === 'long' ? 'Long' : 'Short'} ${best.symbol} — Score ${best.score}/100 | RSI ${best.rsi.toFixed(1)} | Vol ${best.volumeBuildRatio.toFixed(2)}×`;
+      const entryContent = `**${best.direction.toUpperCase()} ${best.symbol}**\n\n**Score:** ${best.score}/100\n**Entry:** ${entryPrice}\n**Stop Loss:** ${slPrice} (${(slPct * 100).toFixed(1)}% away)\n**Exit plan:** Trailing stop activates at +${(slPct * 100).toFixed(1)}%, trails at ${(slPct * 50).toFixed(1)}% below peak. Reversal exit if opposing signal beats score ${best.score}.\n\n**Why:**\n- RSI: ${best.rsi.toFixed(1)}\n- Volume build: ${best.volumeBuildRatio.toFixed(2)}× (recent vs prior)\n- Price vs VWAP: ${vwapDesc}\n- Trend: ${maDesc}\n- Signals fired: ${signalList}${crossNote}`;
+      postToForum(entryTitle, entryContent).catch(() => {});
 
       scanState.positions.push({
         symbol: best.symbol,
