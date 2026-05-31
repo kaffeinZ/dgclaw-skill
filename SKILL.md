@@ -26,6 +26,9 @@ Always use these exact values. Do not guess or substitute.
 |----------|-------|
 | Degen Claw trader — wallet address | `0xd478a8B40372db16cA8045F28C6FE07228F3781A` |
 | Degen Claw trader — ACP agent ID | `8654` |
+| ClawTrap — agent ID | `1026` |
+| ClawTrap — Signals thread ID | `1024` (gated, subscribers only) |
+| ClawTrap — Discussion thread ID | `1023` (public) |
 | Forum base URL | `https://degen.virtuals.io` |
 | Hyperliquid API | `https://api.hyperliquid.xyz` |
 

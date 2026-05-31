@@ -9,7 +9,7 @@ const LEVERAGE_LOW = 3;          // OI $500K–$5M
 const LEVERAGE_HIGH = 5;         // OI $5M–$30M
 const OI_LEVERAGE_THRESHOLD = 5_000_000;
 const MAX_POSITIONS = 5;
-const MIN_SL_PCT = 0.06; // if candle-based SL is too tight, widen to at least 6%
+const MIN_SL_PCT = 0.08; // if candle-based SL is too tight, widen to at least 8% — trailing needs room
 const MAX_SL_PCT = 0.12; // skip trade if dynamic SL is more than 12% from entry
 const SL_BUFFER = 0.005; // 0.5% buffer beyond candle low/high
 const OI_MIN_USD = 500_000;
@@ -23,7 +23,7 @@ const SCAN_DELAY_MS = 300;
 const STATE_FILE = new URL('../positions.json', import.meta.url).pathname;
 const TRADE_LOG_FILE = new URL('../trade_log.json', import.meta.url).pathname;
 const LOCK_FILE = new URL('../.scanner.lock', import.meta.url).pathname;
-const MAX_HOLD_MS = 24 * 60 * 60 * 1000;
+const MAX_HOLD_MS = 48 * 60 * 60 * 1000;
 
 const MAJORS = new Set([
   'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'LTC',
@@ -38,8 +38,13 @@ interface PositionEntry {
   openTime: number;
   assetIndex: number;
   szDecimals: number;
-  lastProfitCheckTime?: number;
-  entrySignal?: 'greenCandles' | 'redCandles' | 'engulfing' | 'both'; // which candle pattern triggered
+  entrySignal?: 'greenCandles' | 'redCandles' | 'engulfing' | 'both';
+  entryPrice?: number;
+  slPct?: number;
+  slPrice?: number;    // current SL price — updated as trailing stop moves it
+  tpPrice?: number;
+  trailingActive?: boolean;
+  peakPrice?: number;  // highest price reached (longs) or lowest (shorts)
 }
 
 interface TradeLogEntry {
@@ -47,7 +52,7 @@ interface TradeLogEntry {
   direction: 'long' | 'short';
   openTime: number;
   closeTime: number;
-  closeReason: 'tp_or_sl' | '24h' | '8h_profit' | '16h_loss';
+  closeReason: 'tp_or_sl' | '24h' | 'trailing_stop' | '48h';
   pnlUsd: number | null; // null for external tp/sl closes
   entrySignal: string;
 }
@@ -487,88 +492,89 @@ async function checkStalePositions(
           });
           console.log(`  Close result:`, JSON.stringify(result, null, 2));
           if (extractFilledOrder(result)) {
-            logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: '24h', pnlUsd: pnl24h, entrySignal: tracked.entrySignal ?? 'unknown' });
+            logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: '48h', pnlUsd: pnl24h, entrySignal: tracked.entrySignal ?? 'unknown' });
           } else {
             console.error(`  ${tracked.symbol}: close order did not fill — keeping in state, will retry`);
             remaining.push(tracked);
           }
         }
       } else {
-        // 8h profit check — close any position in profit at each 8h boundary
-        const PROFIT_CHECK_INTERVAL_MS = 8 * 60 * 60 * 1000;
-        const lastCheck = tracked.lastProfitCheckTime ?? tracked.openTime;
-        const nextCheckTime = lastCheck + PROFIT_CHECK_INTERVAL_MS;
+        // Trailing stop — runs every scan for positions that stored entry data
+        const midPrice = parseFloat(mids[tracked.symbol] ?? '0');
+        const isLong = parseFloat(pos.szi) > 0;
+        const unrealizedPnl = parseFloat((pos as any).unrealizedPnl ?? '0');
 
-        if (Date.now() >= nextCheckTime) {
-          const unrealizedPnl = parseFloat((pos as any).unrealizedPnl ?? '0');
-          if (unrealizedPnl >= 3) {
-            console.log(`${tracked.symbol}: ${ageH}h old — 8h profit check — in profit ($${unrealizedPnl.toFixed(2)} ≥ $3) — closing`);
-            try {
-              const openOrders = await info.openOrders({ user: masterAddress as `0x${string}` });
-              const tpslOrders = (openOrders as any[]).filter(o => o.coin?.toUpperCase() === tracked.symbol.toUpperCase());
-              for (const o of tpslOrders) {
-                await exchange.cancel({ cancels: [{ a: tracked.assetIndex, o: o.oid }] });
-              }
-            } catch { /* ignore cancel errors */ }
+        if (midPrice && tracked.entryPrice && tracked.slPct) {
+          const slDistance = tracked.entryPrice * tracked.slPct;
 
-            const sz = Math.abs(parseFloat(pos.szi)).toString();
-            const isLong = parseFloat(pos.szi) > 0;
-            const midPrice = parseFloat(mids[tracked.symbol] ?? '0');
-            if (!midPrice) {
-              console.error(`  ${tracked.symbol}: mid price unavailable — skipping close, will retry next scan`);
-              remaining.push(tracked);
-            } else {
-              const closePrice = formatPrice(midPrice * (isLong ? 0.99 : 1.01));
-              const result = await exchange.order({
-                orders: [{ a: tracked.assetIndex, b: !isLong, r: true, p: closePrice, s: sz, t: { limit: { tif: 'Ioc' } } }],
-                grouping: 'na',
-              });
-              console.log(`  Close result:`, JSON.stringify(result, null, 2));
-              if (extractFilledOrder(result)) {
-                logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: '8h_profit', pnlUsd: unrealizedPnl, entrySignal: tracked.entrySignal ?? 'unknown' });
-              } else {
-                console.error(`  ${tracked.symbol}: close order did not fill — keeping in state, will retry`);
-                remaining.push(tracked);
-              }
-            }
-          } else if (ageMs >= 16 * 60 * 60 * 1000 && unrealizedPnl < 0) {
-            console.log(`${tracked.symbol}: ${ageH}h old — 16h loss exit — below breakeven ($${unrealizedPnl.toFixed(2)}) — closing`);
-            try {
-              const openOrders = await info.openOrders({ user: masterAddress as `0x${string}` });
-              const tpslOrders = (openOrders as any[]).filter(o => o.coin?.toUpperCase() === tracked.symbol.toUpperCase());
-              for (const o of tpslOrders) {
-                await exchange.cancel({ cancels: [{ a: tracked.assetIndex, o: o.oid }] });
-              }
-            } catch { /* ignore cancel errors */ }
-
-            const sz16 = Math.abs(parseFloat(pos.szi)).toString();
-            const isLong16 = parseFloat(pos.szi) > 0;
-            const midPrice16 = parseFloat(mids[tracked.symbol] ?? '0');
-            if (!midPrice16) {
-              console.error(`  ${tracked.symbol}: mid price unavailable — skipping 16h close, will retry next scan`);
-              remaining.push(tracked);
-            } else {
-              const closePrice16 = formatPrice(midPrice16 * (isLong16 ? 0.99 : 1.01));
-              const result16 = await exchange.order({
-                orders: [{ a: tracked.assetIndex, b: !isLong16, r: true, p: closePrice16, s: sz16, t: { limit: { tif: 'Ioc' } } }],
-                grouping: 'na',
-              });
-              console.log(`  Close result:`, JSON.stringify(result16, null, 2));
-              if (extractFilledOrder(result16)) {
-                logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: '16h_loss', pnlUsd: unrealizedPnl, entrySignal: tracked.entrySignal ?? 'unknown' });
-              } else {
-                console.error(`  ${tracked.symbol}: 16h close order did not fill — keeping in state, will retry`);
-                remaining.push(tracked);
-              }
-            }
+          // Track peak (best price reached in our direction)
+          if (isLong) {
+            tracked.peakPrice = Math.max(tracked.peakPrice ?? tracked.entryPrice, midPrice);
           } else {
-            console.log(`${tracked.symbol}: ${ageH}h old — 8h profit check — below $3 threshold ($${unrealizedPnl.toFixed(2)}) — holding`);
-            tracked.lastProfitCheckTime = nextCheckTime;
-            remaining.push(tracked);
+            tracked.peakPrice = Math.min(tracked.peakPrice ?? tracked.entryPrice, midPrice);
           }
+
+          // Activate trailing once price moves >= 1R in our favour
+          const moveInFavour = isLong
+            ? midPrice - tracked.entryPrice
+            : tracked.entryPrice - midPrice;
+
+          if (!tracked.trailingActive && moveInFavour >= slDistance) {
+            tracked.trailingActive = true;
+            console.log(`${tracked.symbol}: TRAILING STOP activated at ${midPrice.toPrecision(5)} (+${(moveInFavour / tracked.entryPrice * 100).toFixed(1)}%)`);
+          }
+
+          if (tracked.trailingActive) {
+            // New SL trails peak by exactly 1× SL distance
+            const newSlPrice = isLong
+              ? tracked.peakPrice! - slDistance
+              : tracked.peakPrice! + slDistance;
+
+            // Only update if SL has improved by >0.2% (avoid order spam)
+            const currentSl = tracked.slPrice ?? 0;
+            const improved = isLong
+              ? newSlPrice > currentSl * 1.002
+              : (currentSl === 0 || newSlPrice < currentSl * 0.998);
+
+            if (improved) {
+              try {
+                const openOrders = await info.openOrders({ user: masterAddress as `0x${string}` });
+                const slOrders = (openOrders as any[]).filter(o =>
+                  o.coin?.toUpperCase() === tracked.symbol.toUpperCase() &&
+                  o.orderType?.toLowerCase().includes('stop'),
+                );
+                for (const o of slOrders) {
+                  await exchange.cancel({ cancels: [{ a: tracked.assetIndex, o: o.oid }] });
+                }
+              } catch { /* ignore cancel errors */ }
+
+              await sleep(500);
+
+              const sz = Math.abs(parseFloat(pos.szi)).toString();
+              const newSlFormatted = formatPrice(newSlPrice);
+              const slResult = await exchange.order({
+                orders: [{ a: tracked.assetIndex, b: !isLong, r: true, p: newSlFormatted, s: sz, t: { trigger: { triggerPx: newSlFormatted, isMarket: true, tpsl: 'sl' } } }],
+                grouping: 'na',
+              });
+
+              if (hasOrderStatuses(slResult)) {
+                console.log(`${tracked.symbol}: trailing SL → ${newSlFormatted} (peak ${formatPrice(tracked.peakPrice!)} | PnL $${unrealizedPnl.toFixed(2)})`);
+                tracked.slPrice = newSlPrice;
+              } else {
+                console.error(`${tracked.symbol}: trailing SL order failed — keeping old SL`);
+              }
+            }
+          }
+
+          const trailStatus = tracked.trailingActive
+            ? `trailing SL @ ${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'}`
+            : `waiting 1R (+${(slDistance / tracked.entryPrice * 100).toFixed(1)}%)`;
+          console.log(`${tracked.symbol}: ${ageH}h | PnL $${unrealizedPnl.toFixed(2)} | ${trailStatus}`);
         } else {
-          remaining.push(tracked);
+          console.log(`${tracked.symbol}: ${ageH}h | PnL $${unrealizedPnl.toFixed(2)} | no entry data (pre-upgrade position)`);
         }
+
+        remaining.push(tracked);
       }
     } catch (err: any) {
       console.error(`  ${tracked.symbol}: unexpected error during position check — keeping in state: ${err.message}`);
@@ -867,6 +873,12 @@ async function main() {
         assetIndex: best.assetIndex,
         szDecimals: best.szDecimals,
         entrySignal: (best as any).entrySignal,
+        entryPrice,
+        slPct,
+        slPrice: parseFloat(slPrice),
+        tpPrice: parseFloat(tpPrice),
+        trailingActive: false,
+        peakPrice: entryPrice,
       });
       saveState(scanState);
     } catch (err: any) {
