@@ -9,8 +9,8 @@ const LEVERAGE_LOW = 3;          // OI $500K–$5M
 const LEVERAGE_HIGH = 5;         // OI $5M–$30M
 const OI_LEVERAGE_THRESHOLD = 5_000_000;
 const MAX_POSITIONS = 5;
-const MIN_SL_PCT = 0.08; // if candle-based SL is too tight, widen to at least 8% — trailing needs room
-const MAX_SL_PCT = 0.12; // skip trade if dynamic SL is more than 12% from entry
+const MIN_SL_PCT = 0.04; // minimum SL — below 15m noise floor
+const MAX_SL_PCT = 0.08; // skip trade if SL wider than 8% — too risky
 const SL_BUFFER = 0.005; // 0.5% buffer beyond candle low/high
 const OI_MIN_USD = 500_000;
 const OI_MAX_USD = 30_000_000;
@@ -23,7 +23,6 @@ const SCAN_DELAY_MS = 300;
 const STATE_FILE = new URL('../positions.json', import.meta.url).pathname;
 const TRADE_LOG_FILE = new URL('../trade_log.json', import.meta.url).pathname;
 const LOCK_FILE = new URL('../.scanner.lock', import.meta.url).pathname;
-const MAX_HOLD_MS = 48 * 60 * 60 * 1000;
 
 const MAJORS = new Set([
   'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'LTC',
@@ -38,11 +37,11 @@ interface PositionEntry {
   openTime: number;
   assetIndex: number;
   szDecimals: number;
-  entrySignal?: 'greenCandles' | 'redCandles' | 'engulfing' | 'both';
+  entrySignal?: 'greenCandles' | 'redCandles' | 'goldenCross' | 'deathCross' | 'none';
+  entryScore?: number;
   entryPrice?: number;
   slPct?: number;
   slPrice?: number;    // current SL price — updated as trailing stop moves it
-  tpPrice?: number;
   trailingActive?: boolean;
   peakPrice?: number;  // highest price reached (longs) or lowest (shorts)
 }
@@ -52,7 +51,8 @@ interface TradeLogEntry {
   direction: 'long' | 'short';
   openTime: number;
   closeTime: number;
-  closeReason: 'tp_or_sl' | '24h' | 'trailing_stop' | '48h';
+  closeReason: 'tp_or_sl' | 'signal_reversal' | 'trailing_stop';
+  entryScore?: number;
   pnlUsd: number | null; // null for external tp/sl closes
   entrySignal: string;
 }
@@ -91,6 +91,9 @@ interface SignalResult {
   leverage: number;
   lastClose: number;
   ma50: number | null;
+  ma200: number | null;
+  vwap: number;
+  isCross: boolean;
 }
 
 async function hlPost(body: object): Promise<any> {
@@ -212,16 +215,11 @@ async function analyzeAsset(
     const bothGreen = prevClose > prevOpen && lastClose > lastOpen;
     const bothRed = prevClose < prevOpen && lastClose < lastOpen;
 
-    // Engulfing patterns: last candle body fully swallows previous candle body
-    const bullishEngulfing = prevClose < prevOpen          // prev candle red
-      && lastClose > lastOpen                              // last candle green
-      && lastOpen <= prevClose                             // opens at or below prior close
-      && lastClose >= prevOpen;                            // closes at or above prior open
-
-    const bearishEngulfing = prevClose > prevOpen          // prev candle green
-      && lastClose < lastOpen                              // last candle red
-      && lastOpen >= prevClose                             // opens at or above prior close
-      && lastClose <= prevOpen;                            // closes at or below prior open
+    // Engulfing patterns: last candle body fully swallows previous candle body (scoring bonus only)
+    const bullishEngulfing = prevClose < prevOpen && lastClose > lastOpen
+      && lastOpen <= prevClose && lastClose >= prevOpen;
+    const bearishEngulfing = prevClose > prevOpen && lastClose < lastOpen
+      && lastOpen >= prevClose && lastClose <= prevOpen;
 
     // % price moved over the 2 candles
     const candleMovePct = closes[n - 3] > 0 ? Math.abs(lastClose - closes[n - 3]) / closes[n - 3] : 0;
@@ -249,14 +247,12 @@ async function analyzeAsset(
       obv: obvRising,
       priceVsVwap: vwap > 0 && lastClose <= vwap * 1.05,
       greenCandles: bothGreen,
-      engulfing: bullishEngulfing,
     };
     const shortBase: Record<string, boolean> = {
       rsi: lastRSI >= 35 && lastRSI <= 70,
       obv: !obvRising,
       priceVsVwap: vwap > 0 && lastClose >= vwap * 0.95,
       redCandles: bothRed,
-      engulfing: bearishEngulfing,
     };
 
     if (goldenCross) console.log(`  ${symbol}: GOLDEN CROSS — 50 MA crossed above 200 MA`);
@@ -266,8 +262,8 @@ async function analyzeAsset(
     const shortScore = calcStrengthScore('short', lastRSI, obvRisingCount, bullishEngulfing, bearishEngulfing, bothGreen, bothRed, vwap, lastClose, volumeBuildRatio, ma50, ma200, goldenCross, deathCross);
 
     return {
-      long: { symbol, direction: 'long', score: longScore, signals: longBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: longSLPrice, candleMovePct, oiUsd, leverage, lastClose, ma50 },
-      short: { symbol, direction: 'short', score: shortScore, signals: shortBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: shortSLPrice, candleMovePct, oiUsd, leverage, lastClose, ma50 },
+      long: { symbol, direction: 'long', score: longScore, signals: longBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: longSLPrice, candleMovePct, oiUsd, leverage, lastClose, ma50, ma200, vwap, isCross: goldenCross },
+      short: { symbol, direction: 'short', score: shortScore, signals: shortBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: shortSLPrice, candleMovePct, oiUsd, leverage, lastClose, ma50, ma200, vwap, isCross: deathCross },
     };
   } catch {
     return { long: null, short: null };
@@ -304,13 +300,13 @@ function calcStrengthScore(
   const obvSteps = direction === 'long' ? obvRisingCount : (5 - obvRisingCount);
   score += Math.max(0, (obvSteps - 1) / 4) * 15;
 
-  // Candle pattern (0–15 pts): engulfing=15, same-direction=10
+  // Candle pattern (0–20 pts): same-direction candles 10pts + engulfing 10pts (additive)
   if (direction === 'long') {
-    if (bullishEngulfing) score += 15;
-    else if (bothGreen) score += 10;
+    if (bothGreen) score += 10;
+    if (bullishEngulfing) score += 10;
   } else {
-    if (bearishEngulfing) score += 15;
-    else if (bothRed) score += 10;
+    if (bothRed) score += 10;
+    if (bearishEngulfing) score += 10;
   }
 
   // Price vs VWAP (0–15 pts): symmetric — rewards entries within 5% of VWAP on either side.
@@ -425,6 +421,59 @@ function logTrade(entry: TradeLogEntry): void {
   fs.writeFileSync(TRADE_LOG_FILE, JSON.stringify(log, null, 2));
 }
 
+async function getReversalScore(symbol: string, direction: 'long' | 'short'): Promise<number> {
+  try {
+    const now = Date.now();
+    const startTime = now - CANDLE_COUNT * CANDLE_INTERVAL_MS;
+    const candles: Candle[] = await hlPost({
+      type: 'candleSnapshot',
+      req: { coin: symbol, interval: CANDLE_INTERVAL, startTime, endTime: now },
+    });
+    if (!Array.isArray(candles) || candles.length < 20) return 0;
+
+    const closes  = candles.map(c => parseFloat(c.c));
+    const opens   = candles.map(c => parseFloat(c.o));
+    const volumes = candles.map(c => parseFloat(c.v));
+    const n = candles.length;
+
+    const rsiValues = calcRSI(closes, RSI_PERIOD);
+    if (rsiValues.length < 3) return 0;
+    const lastRSI = rsiValues[rsiValues.length - 1];
+
+    const obvValues = calcOBV(closes, volumes);
+    const obvLast6 = obvValues.slice(-6);
+    let obvRisingCount = 0;
+    for (let i = 1; i < obvLast6.length; i++) {
+      if (obvLast6[i] > obvLast6[i - 1]) obvRisingCount++;
+    }
+
+    const vwap      = calcVWAP(candles);
+    const lastClose = closes[n - 1];
+    const lastOpen  = opens[n - 1];
+    const prevClose = closes[n - 2];
+    const prevOpen  = opens[n - 2];
+
+    const bothGreen        = prevClose > prevOpen && lastClose > lastOpen;
+    const bothRed          = prevClose < prevOpen && lastClose < lastOpen;
+    const bullishEngulfing = prevClose < prevOpen && lastClose > lastOpen && lastOpen <= prevClose && lastClose >= prevOpen;
+    const bearishEngulfing = prevClose > prevOpen && lastClose < lastOpen && lastOpen >= prevClose && lastClose <= prevOpen;
+    const recentAvgVol   = (volumes[n-1] + volumes[n-2] + volumes[n-3]) / 3;
+    const priorAvgVol    = (volumes[n-4] + volumes[n-5] + volumes[n-6]) / 3;
+    const volumeBuildRatio = priorAvgVol > 0 ? recentAvgVol / priorAvgVol : 0;
+
+    const ma50     = closes.length >= 50  ? closes.slice(-50).reduce((a, b) => a + b, 0) / 50   : null;
+    const ma200    = closes.length >= 200 ? closes.slice(-200).reduce((a, b) => a + b, 0) / 200 : null;
+    const prevMa50 = closes.length >= 51  ? closes.slice(-51, -1).reduce((a, b) => a + b, 0) / 50  : null;
+    const prevMa200= closes.length >= 201 ? closes.slice(-201, -1).reduce((a, b) => a + b, 0) / 200 : null;
+    const goldenCross = ma50 !== null && ma200 !== null && prevMa50 !== null && prevMa200 !== null && prevMa50 <= prevMa200 && ma50 > ma200;
+    const deathCross  = ma50 !== null && ma200 !== null && prevMa50 !== null && prevMa200 !== null && prevMa50 >= prevMa200 && ma50 < ma200;
+
+    return calcStrengthScore(direction, lastRSI, obvRisingCount, bullishEngulfing, bearishEngulfing, bothGreen, bothRed, vwap, lastClose, volumeBuildRatio, ma50, ma200, goldenCross, deathCross);
+  } catch {
+    return 0;
+  }
+}
+
 async function checkStalePositions(
   exchange: ExchangeClient,
   info: InfoClient,
@@ -459,7 +508,7 @@ async function checkStalePositions(
         } catch {
           // ignore — pnlUsd stays null
         }
-        console.log(`${tracked.symbol}: closed externally (TP/SL hit) — PnL: ${realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown'}`);
+        console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=SL_hit | PnL=${realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown'} | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'} | entryScore=${tracked.entryScore ?? '?'}`);
         logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: 'tp_or_sl', pnlUsd: realizedPnl, entrySignal: tracked.entrySignal ?? 'unknown' });
         continue;
       }
@@ -467,38 +516,51 @@ async function checkStalePositions(
       const ageMs = Date.now() - tracked.openTime;
       const ageH = (ageMs / 3_600_000).toFixed(1);
 
-      if (ageMs >= MAX_HOLD_MS) {
-        const pnl24h = parseFloat((pos as any).unrealizedPnl ?? '0');
-        console.log(`${tracked.symbol}: ${ageH}h old — closing (24h hard exit) — PnL: $${pnl24h.toFixed(2)}`);
-        try {
-          const openOrders = await info.openOrders({ user: masterAddress as `0x${string}` });
-          const tpslOrders = (openOrders as any[]).filter(o => o.coin?.toUpperCase() === tracked.symbol.toUpperCase());
-          for (const o of tpslOrders) {
-            await exchange.cancel({ cancels: [{ a: tracked.assetIndex, o: o.oid }] });
-          }
-        } catch { /* ignore cancel errors */ }
+      // Reversal exit — check if opposing 15m signal now scores > entry score (min 2h hold)
+      const MIN_HOLD_REVERSAL_MS = 2 * 60 * 60 * 1000;
+      if (tracked.entryScore && ageMs >= MIN_HOLD_REVERSAL_MS) {
+        const oppositeDir = tracked.direction === 'long' ? 'short' : 'long';
+        const reversalScore = await getReversalScore(tracked.symbol, oppositeDir);
+        if (reversalScore > tracked.entryScore) {
+          const unrealizedPnl = parseFloat((pos as any).unrealizedPnl ?? '0');
+          console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=signal_reversal | PnL=$${unrealizedPnl.toFixed(4)} | entryScore=${tracked.entryScore} | reversalScore=${reversalScore} (${oppositeDir}) | held=${ageH}h | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'}`);
+          try {
+            const openOrders = await info.openOrders({ user: masterAddress as `0x${string}` });
+            const slOrders = (openOrders as any[]).filter(o =>
+              o.coin?.toUpperCase() === tracked.symbol.toUpperCase() &&
+              o.orderType?.toLowerCase().includes('stop'),
+            );
+            for (const o of slOrders) {
+              await exchange.cancel({ cancels: [{ a: tracked.assetIndex, o: o.oid }] });
+            }
+          } catch { /* ignore cancel errors */ }
 
-        const sz = Math.abs(parseFloat(pos.szi)).toString();
-        const isLong = parseFloat(pos.szi) > 0;
-        const midPrice = parseFloat(mids[tracked.symbol] ?? '0');
-        if (!midPrice) {
-          console.error(`  ${tracked.symbol}: mid price unavailable — skipping close, will retry next scan`);
-          remaining.push(tracked);
-        } else {
-          const closePrice = formatPrice(midPrice * (isLong ? 0.99 : 1.01));
-          const result = await exchange.order({
-            orders: [{ a: tracked.assetIndex, b: !isLong, r: true, p: closePrice, s: sz, t: { limit: { tif: 'Ioc' } } }],
-            grouping: 'na',
-          });
-          console.log(`  Close result:`, JSON.stringify(result, null, 2));
-          if (extractFilledOrder(result)) {
-            logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: '48h', pnlUsd: pnl24h, entrySignal: tracked.entrySignal ?? 'unknown' });
-          } else {
-            console.error(`  ${tracked.symbol}: close order did not fill — keeping in state, will retry`);
+          const sz = Math.abs(parseFloat(pos.szi)).toString();
+          const isLong = parseFloat(pos.szi) > 0;
+          const midPrice = parseFloat(mids[tracked.symbol] ?? '0');
+          if (!midPrice) {
+            console.error(`  ${tracked.symbol}: mid price unavailable — skipping reversal close, will retry`);
             remaining.push(tracked);
+          } else {
+            const closePrice = formatPrice(midPrice * (isLong ? 0.99 : 1.01));
+            const result = await exchange.order({
+              orders: [{ a: tracked.assetIndex, b: !isLong, r: true, p: closePrice, s: sz, t: { limit: { tif: 'Ioc' } } }],
+              grouping: 'na',
+            });
+            if (extractFilledOrder(result)) {
+              logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: 'signal_reversal', pnlUsd: unrealizedPnl, entrySignal: tracked.entrySignal ?? 'unknown', entryScore: tracked.entryScore });
+            } else {
+              console.error(`  ${tracked.symbol}: reversal close did not fill — keeping in state, will retry`);
+              remaining.push(tracked);
+            }
           }
+          continue;
+        } else {
+          console.log(`${tracked.symbol}: ${ageH}h | reversal ${oppositeDir} scores ${reversalScore} vs entry ${tracked.entryScore} — holding`);
         }
-      } else {
+      }
+
+      {
         // Trailing stop — runs every scan for positions that stored entry data
         const midPrice = parseFloat(mids[tracked.symbol] ?? '0');
         const isLong = parseFloat(pos.szi) > 0;
@@ -521,14 +583,15 @@ async function checkStalePositions(
 
           if (!tracked.trailingActive && moveInFavour >= slDistance) {
             tracked.trailingActive = true;
-            console.log(`${tracked.symbol}: TRAILING STOP activated at ${midPrice.toPrecision(5)} (+${(moveInFavour / tracked.entryPrice * 100).toFixed(1)}%)`);
+            console.log(`TRAIL | ${tracked.symbol} ${tracked.direction.toUpperCase()} | ACTIVATED at ${midPrice.toPrecision(5)} (+${(moveInFavour / tracked.entryPrice * 100).toFixed(1)}% from entry ${tracked.entryPrice}) | SL moves to breakeven`);
           }
 
           if (tracked.trailingActive) {
-            // New SL trails peak by exactly 1× SL distance
+            // New SL trails peak by 0.5× SL distance — locks profit quickly
+            const trailDistance = slDistance * 0.5;
             const newSlPrice = isLong
-              ? tracked.peakPrice! - slDistance
-              : tracked.peakPrice! + slDistance;
+              ? tracked.peakPrice! - trailDistance
+              : tracked.peakPrice! + trailDistance;
 
             // Only update if SL has improved by >0.2% (avoid order spam)
             const currentSl = tracked.slPrice ?? 0;
@@ -558,7 +621,7 @@ async function checkStalePositions(
               });
 
               if (hasOrderStatuses(slResult)) {
-                console.log(`${tracked.symbol}: trailing SL → ${newSlFormatted} (peak ${formatPrice(tracked.peakPrice!)} | PnL $${unrealizedPnl.toFixed(2)})`);
+                console.log(`TRAIL | ${tracked.symbol} ${tracked.direction.toUpperCase()} | SL moved → ${newSlFormatted} | peak=${formatPrice(tracked.peakPrice!)} | locked=${((Math.abs(tracked.peakPrice! - tracked.entryPrice!) / tracked.entryPrice!) * 100 / 2).toFixed(1)}% | PnL=$${unrealizedPnl.toFixed(4)}`);
                 tracked.slPrice = newSlPrice;
               } else {
                 console.error(`${tracked.symbol}: trailing SL order failed — keeping old SL`);
@@ -702,38 +765,49 @@ async function main() {
 
   const slotsAvailable = dryRun ? MAX_POSITIONS : MAX_POSITIONS - openPositions.length;
 
-  // OBV + candle mandatory; RSI scoring only; 50 MA hard directional gate; min score = 45
-  const MIN_ENTRY_SCORE = 45;
+  // OBV hard gate; RSI hard gates; 50 MA directional gate; min score = 60
+  // Candle pattern is scored only — not a hard gate
+  // EXCEPTION: golden/death cross bypasses ALL gates and enters as priority
+  const MIN_ENTRY_SCORE = 60;
   const seen = new Set<string>();
   const eligible = allResults.filter(r => {
-    const candleSignal = r.direction === 'long' ? 'greenCandles' : 'redCandles';
+    if (openCoins.has(r.symbol.toUpperCase())) return false;
+    if (seen.has(r.symbol)) return false;
+    seen.add(r.symbol);
+    // Golden/death cross: priority entry — bypass all hard gates and score
+    if (r.isCross) return true;
+    // Normal entry gates
     if (!r.signals.obv) return false;
-    if (!r.signals[candleSignal]) return false;
     if (r.score < MIN_ENTRY_SCORE) return false;
-    // RSI hard gates: block extreme overbought longs and extreme oversold shorts
     if (r.direction === 'long'  && r.rsi > 75) return false;
     if (r.direction === 'short' && r.rsi < 25) return false;
-    // 50 MA hard gate: no longs below 50 MA, no shorts above 50 MA
     if (r.ma50 !== null) {
       if (r.direction === 'long' && r.lastClose < r.ma50) return false;
       if (r.direction === 'short' && r.lastClose > r.ma50) return false;
     }
-    if (openCoins.has(r.symbol.toUpperCase())) return false;
-    if (seen.has(r.symbol)) return false;
-    seen.add(r.symbol);
     return true;
   });
 
-  // Tag each eligible result with which candle pattern triggered entry
+  // Tag each eligible result with entry signal type
   for (const r of eligible) {
     const candleSignal = r.direction === 'long' ? 'greenCandles' : 'redCandles';
     const hasCandles = r.signals[candleSignal];
-    const hasEngulfing = r.signals.engulfing;
-    (r as any).entrySignal = hasCandles && hasEngulfing ? 'both' : hasEngulfing ? 'engulfing' : candleSignal;
+    if (r.isCross) {
+      (r as any).entrySignal = r.direction === 'long' ? 'goldenCross' : 'deathCross';
+    } else {
+      (r as any).entrySignal = hasCandles ? candleSignal : 'none';
+    }
   }
 
+  // Sort: cross entries first (priority), then by score
+  eligible.sort((a, b) => {
+    if (a.isCross && !b.isCross) return -1;
+    if (!a.isCross && b.isCross) return 1;
+    return b.score - a.score;
+  });
+
   if (eligible.length === 0) {
-    console.log(`\nNo asset met entry criteria (OBV+candle mandatory, 50 MA gate, score≥${MIN_ENTRY_SCORE}) — no trade`);
+    console.log(`\nNo asset met entry criteria (OBV hard gate, RSI gates, 50 MA gate, score≥${MIN_ENTRY_SCORE}) — no trade`);
     return;
   }
 
@@ -804,36 +878,23 @@ async function main() {
       const slPct = Math.max(dynamicSlPct, MIN_SL_PCT);
       const slDistance = entryPrice * slPct;
       const slPrice = formatPrice(isLong ? entryPrice - slDistance : entryPrice + slDistance);
-      const tpPrice = formatPrice(isLong ? entryPrice + 2 * slDistance : entryPrice - 2 * slDistance);
 
-      console.log(`  Filled entry: ${entryPrice} | Filled size: ${sz} | TP: ${tpPrice} | SL: ${slPrice} (${(slPct * 100).toFixed(1)}% away)`);
       if (dynamicSlPct < MIN_SL_PCT) {
         console.log(`  Dynamic SL was ${(dynamicSlPct * 100).toFixed(1)}% away from real fill — widened to minimum ${(MIN_SL_PCT * 100).toFixed(1)}%`);
       }
 
+      // Full entry signal log — source for forum posts
+      const vwapDistPct2 = best.vwap > 0 ? ((best.lastClose - best.vwap) / best.vwap * 100).toFixed(1) : 'n/a';
+      const maAlign2 = best.ma50 !== null && best.ma200 !== null
+        ? (best.ma50 > best.ma200 ? 'bull(MA50>MA200)' : 'bear(MA50<MA200)')
+        : 'unknown';
+      const passedSignals2 = Object.entries(best.signals).filter(([, v]) => v).map(([k]) => k).join(', ');
+      console.log(`ENTRY | ${best.symbol} ${best.direction.toUpperCase()} | score=${best.score}/100 | RSI=${best.rsi.toFixed(1)} | vol=${best.volumeBuildRatio.toFixed(2)}x | VWAP=${vwapDistPct2}% | MA=${maAlign2}${best.isCross ? ' | CROSS=true' : ''} | signals=[${passedSignals2}] | entry=${entryPrice} | SL=${slPrice} (${(slPct * 100).toFixed(1)}%)`);
+
       if (paperEntry) {
-        console.log(`  [PAPER ENTRY] Would set TP: ${tpPrice} and SL: ${slPrice} for size ${sz}`);
+        console.log(`  [PAPER ENTRY] Would set SL: ${slPrice} for size ${sz}`);
         continue;
       }
-
-      await sleep(1000);
-
-      const tpResult = await exchange.order({
-        orders: [{ a: best.assetIndex, b: !isLong, r: true, p: tpPrice, s: sz, t: { trigger: { triggerPx: tpPrice, isMarket: true, tpsl: 'tp' } } }],
-        grouping: 'na',
-      });
-      console.log('TP order result:', JSON.stringify(tpResult, null, 2));
-      if (!hasOrderStatuses(tpResult)) {
-        console.error(`  ${best.symbol}: TP order response did not contain statuses — closing position for safety`);
-        const closePrice = formatPrice(entryPrice * (isLong ? 0.99 : 1.01));
-        const closeResult = await exchange.order({
-          orders: [{ a: best.assetIndex, b: !isLong, r: true, p: closePrice, s: sz, t: { limit: { tif: 'Ioc' } } }],
-          grouping: 'na',
-        });
-        console.log('Safety close result:', JSON.stringify(closeResult, null, 2));
-        continue;
-      }
-      console.log(`TP set: ${tpPrice}`);
 
       await sleep(1000);
 
@@ -873,10 +934,10 @@ async function main() {
         assetIndex: best.assetIndex,
         szDecimals: best.szDecimals,
         entrySignal: (best as any).entrySignal,
+        entryScore: best.score,
         entryPrice,
         slPct,
         slPrice: parseFloat(slPrice),
-        tpPrice: parseFloat(tpPrice),
         trailingActive: false,
         peakPrice: entryPrice,
       });

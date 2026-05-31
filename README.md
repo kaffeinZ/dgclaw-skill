@@ -103,10 +103,11 @@ The scanner (`scripts/scanner.ts`) runs every 15 minutes, scans all Hyperliquid 
 ### Entry criteria (all must pass)
 
 1. **OBV rising** — at least 3 of the last 5 OBV steps must be rising (hard gate, not scored)
-2. **Candle direction** — 2 consecutive green candles (long) or 2 consecutive red candles (short) on the 15m chart (hard gate, not scored)
-3. **MA50 directional gate** — no longs below the 50-period MA, no shorts above it (hard gate, not scored)
-4. **RSI hard gate** — longs blocked if RSI > 75 (extremely overbought); shorts blocked if RSI < 25 (extremely oversold). Prevents counter-trend disaster entries.
-5. **Minimum score ≥ 45** — from the scoring system below
+2. **MA50 directional gate** — no longs below the 50-period MA, no shorts above it (hard gate, not scored)
+3. **RSI hard gate** — longs blocked if RSI > 75; shorts blocked if RSI < 25. Prevents disaster counter-trend entries.
+4. **Minimum score ≥ 60** — from the scoring system below
+
+> Candle pattern (2 same-direction candles) is **scored only** (10–15pts) — not a hard gate. A strong RSI + OBV + volume setup can enter without a perfect candle pattern.
 
 ### Scoring system (max ~95 pts)
 
@@ -120,18 +121,29 @@ The scanner (`scripts/scanner.ts`) runs every 15 minutes, scans all Hyperliquid 
 | MA50 > MA200 | +5 | Bonus when the 50 MA is above the 200 MA (bull trend for longs) or below (bear trend for shorts). |
 | Golden/death cross | +10 | Bonus when the 50 MA just crossed the 200 MA in the signal direction. |
 
-**Max possible: 95 pts** (80 from core signals + 15 bonuses). A typical qualifying entry scores 45–60.
-
-> **What changed and why (2026-05-29):** RSI peaks shifted from 30/70 to 45/55 — trade analysis showed wins clustered at RSI 40–65, not at the extremes. VWAP scoring made symmetric so longs aren't penalised during market pumps. Volume raised to 20pts as it was the clearest differentiator between wins (≥2×) and losses (<1×). RSI hard gates added after two -$3 losses: VINE long at RSI 78.9 and VIRTUAL short at RSI 17.7.
+**Max possible: 95 pts** (80 from core signals + 15 bonuses). A typical qualifying entry scores 60–75.
 
 ### Exit logic
 
+No time-based exits. All exits are signal or price driven.
+
 | Exit type | Condition |
 |-----------|-----------|
-| TP / SL | Set at entry: TP = 2× SL distance from fill price, SL = candle low/high ± 0.5% buffer (min 6%, max 12%) |
-| 8h profit | At every 8h boundary: if unrealised PnL ≥ $3, close immediately |
-| 16h loss | At the 16h mark: if unrealised PnL < $0 (below breakeven), close immediately — cuts slow bleeds before the 24h hard exit |
-| 24h hard exit | Closes any remaining position at 24h regardless of PnL |
+| **SL** | Fixed at entry: candle low/high ± 0.5% buffer. Min **4%**, max **8%** (trade skipped if candle structure requires >8%). |
+| **Trailing stop** | Activates once price moves ≥ 1× SL distance in our favour (breakeven locked). Trails the peak price by **0.5× SL distance** — tighter trail locks profit quickly. No TP ceiling — winners run. |
+| **Reversal exit** | Every 15m scan: checks if the opposing signal now scores **higher than the entry score** on the same 15m timeframe. If yes → market close. Minimum 2h hold before reversal can fire. Exits when the market genuinely turns, not on noise. |
+
+**How the math works (example — SL 5%):**
+- Entry $1.00 → SL $0.95 (-5%)
+- Trailing activates at $1.05 (+5%) → stop moves to $1.00 (breakeven)
+- At $1.10 → stop at $1.075 (+7.5% locked)
+- At $1.20 → stop at $1.175 (+17.5% locked)
+- No TP — trade runs until trailing stop or reversal fires
+
+**Why this replaced time exits:**
+- 8h/16h/24h exits were cutting 33 trades for -$22.88 on slow bleeds that never hit SL
+- Real win rate: **55.8%** (40% was skewed by a null PnL logging bug on 38 trades)
+- EV with 55.8% win rate: `(0.558 × 2) - (0.442 × 1) = +0.674` per trade (before trailing improvement)
 
 ### Asset universe filters
 
