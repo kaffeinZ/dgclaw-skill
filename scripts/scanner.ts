@@ -26,7 +26,7 @@ const LOCK_FILE = new URL('../.scanner.lock', import.meta.url).pathname;
 
 const FORUM_BASE = 'https://degen.virtuals.io';
 const FORUM_AGENT_ID = '1026';
-const FORUM_SIGNALS_THREAD = '1024';
+const FORUM_SIGNALS_THREAD = '1023';
 
 const MAJORS = new Set([
   'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'LTC',
@@ -425,6 +425,31 @@ function logTrade(entry: TradeLogEntry): void {
   fs.writeFileSync(TRADE_LOG_FILE, JSON.stringify(log, null, 2));
 }
 
+async function generatePostContent(prompt: string): Promise<string | null> {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'deepseek/deepseek-v4-flash',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 200,
+        temperature: 0.7,
+      }),
+    });
+    if (!res.ok) return null;
+    const data: any = await res.json();
+    return data?.choices?.[0]?.message?.content?.trim() ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function postToForum(title: string, content: string): Promise<void> {
   const apiKey = process.env.DGCLAW_API_KEY;
   if (!apiKey) {
@@ -539,10 +564,14 @@ async function checkStalePositions(
         logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: 'tp_or_sl', pnlUsd: realizedPnl, entrySignal: tracked.entrySignal ?? 'unknown' });
         const heldH = ((Date.now() - tracked.openTime) / 3_600_000).toFixed(1);
         const slPnlStr = realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown';
-        postToForum(
-          `Closed ${tracked.symbol} ${tracked.direction} — ${realizedPnl !== null && realizedPnl >= 0 ? '+' : ''}${slPnlStr} | SL hit`,
-          `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — Stop Loss hit**\n\n**PnL:** ${slPnlStr}\n**Held:** ${heldH}h\n**Entry:** ${tracked.entryPrice ?? '?'} | **SL:** ${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'}\n**Entry score:** ${tracked.entryScore ?? '?'}/100\n\nStop loss triggered. Price moved against the entry thesis.`
-        ).catch(() => {});
+        const slTitle = `Closed ${tracked.symbol} ${tracked.direction} — ${realizedPnl !== null && realizedPnl >= 0 ? '+' : ''}${slPnlStr} | SL hit`;
+        const slTemplate = `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — Stop Loss hit** | PnL: ${slPnlStr} | Held: ${heldH}h | Entry score: ${tracked.entryScore ?? '?'}/100`;
+        const slPrompt = `You are a crypto perp trader posting a trade close on a forum. Write 2-3 natural sentences about this stop loss exit. Be honest and brief.\n\nTrade: ${tracked.direction.toUpperCase()} ${tracked.symbol} | PnL: ${slPnlStr} | Held: ${heldH}h | Entry score: ${tracked.entryScore ?? '?'}/100 | Stop loss triggered.`;
+        generatePostContent(slPrompt).then(aiContent => {
+          postToForum(slTitle, aiContent ?? slTemplate).catch(() => {});
+        }).catch(() => {
+          postToForum(slTitle, slTemplate).catch(() => {});
+        });
         continue;
       }
 
@@ -557,10 +586,14 @@ async function checkStalePositions(
         if (reversalScore > tracked.entryScore) {
           const unrealizedPnl = parseFloat((pos as any).unrealizedPnl ?? '0');
           console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=signal_reversal | PnL=$${unrealizedPnl.toFixed(4)} | entryScore=${tracked.entryScore} | reversalScore=${reversalScore} (${oppositeDir}) | held=${ageH}h | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'}`);
-          postToForum(
-            `Closed ${tracked.symbol} ${tracked.direction} — ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Signal reversal`,
-            `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — Signal reversal**\n\n**PnL:** ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)}\n**Held:** ${ageH}h\n**Entry score:** ${tracked.entryScore}/100\n**Reversal score:** ${reversalScore}/100 (${oppositeDir} signal)\n**Entry:** ${tracked.entryPrice ?? '?'}\n\nOpposing ${oppositeDir} signal scored ${reversalScore} vs entry score ${tracked.entryScore} — market momentum reversed, exiting before SL.`
-          ).catch(() => {});
+          const revTitle = `Closed ${tracked.symbol} ${tracked.direction} — ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Signal reversal`;
+          const revTemplate = `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — Signal reversal** | PnL: ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Held: ${ageH}h | Reversal score: ${reversalScore} vs entry: ${tracked.entryScore}`;
+          const revPrompt = `You are a crypto perp trader posting a trade close on a forum. Write 2-3 natural sentences about this signal reversal exit. Be honest and brief.\n\nTrade: ${tracked.direction.toUpperCase()} ${tracked.symbol} | PnL: ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Held: ${ageH}h | Entry score: ${tracked.entryScore}/100 | Opposing ${oppositeDir} signal scored ${reversalScore} — momentum reversed.`;
+          generatePostContent(revPrompt).then(aiContent => {
+            postToForum(revTitle, aiContent ?? revTemplate).catch(() => {});
+          }).catch(() => {
+            postToForum(revTitle, revTemplate).catch(() => {});
+          });
           try {
             const openOrders = await info.openOrders({ user: masterAddress as `0x${string}` });
             const slOrders = (openOrders as any[]).filter(o =>
@@ -972,8 +1005,13 @@ async function main() {
       const signalList = Object.entries(best.signals).filter(([, v]) => v).map(([k]) => k).join(', ');
       const crossNote = best.isCross ? `\n- **Golden/Death Cross**: yes — priority entry, overrides normal gates` : '';
       const entryTitle = `${best.direction === 'long' ? 'Long' : 'Short'} ${best.symbol} — Score ${best.score}/100 | RSI ${best.rsi.toFixed(1)} | Vol ${best.volumeBuildRatio.toFixed(2)}×`;
-      const entryContent = `**${best.direction.toUpperCase()} ${best.symbol}**\n\n**Score:** ${best.score}/100\n**Entry:** ${entryPrice}\n**Stop Loss:** ${slPrice} (${(slPct * 100).toFixed(1)}% away)\n**Exit plan:** Trailing stop activates at +${(slPct * 100).toFixed(1)}%, trails at ${(slPct * 50).toFixed(1)}% below peak. Reversal exit if opposing signal beats score ${best.score}.\n\n**Why:**\n- RSI: ${best.rsi.toFixed(1)}\n- Volume build: ${best.volumeBuildRatio.toFixed(2)}× (recent vs prior)\n- Price vs VWAP: ${vwapDesc}\n- Trend: ${maDesc}\n- Signals fired: ${signalList}${crossNote}`;
-      postToForum(entryTitle, entryContent).catch(() => {});
+      const entryTemplate = `**${best.direction.toUpperCase()} ${best.symbol}** | Score: ${best.score}/100 | Entry: ${entryPrice} | SL: ${slPrice} (${(slPct * 100).toFixed(1)}%)\nRSI: ${best.rsi.toFixed(1)} | Vol: ${best.volumeBuildRatio.toFixed(2)}× | VWAP: ${vwapDesc} | Trend: ${maDesc}\nSignals: ${signalList}${crossNote}`;
+      const entryPrompt = `You are a crypto perp trader posting a signal on a trading forum. Write a natural 3-4 sentence trading rationale for this entry. Be concise and confident, like a real trader — not robotic. Include the key reason for the entry and the risk level.\n\nTrade data:\n- ${best.direction.toUpperCase()} ${best.symbol}\n- Score: ${best.score}/100\n- RSI: ${best.rsi.toFixed(1)}\n- Volume build: ${best.volumeBuildRatio.toFixed(2)}× (recent vs prior candles)\n- Price vs VWAP: ${vwapDesc}\n- Trend: ${maDesc}\n- Signals fired: ${signalList}${best.isCross ? '\n- Golden/Death Cross fired — priority entry' : ''}\n- Entry: ${entryPrice} | SL: ${slPrice} (${(slPct * 100).toFixed(1)}% away)`;
+      generatePostContent(entryPrompt).then(aiContent => {
+        postToForum(entryTitle, aiContent ?? entryTemplate).catch(() => {});
+      }).catch(() => {
+        postToForum(entryTitle, entryTemplate).catch(() => {});
+      });
 
       scanState.positions.push({
         symbol: best.symbol,

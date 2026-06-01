@@ -64,6 +64,7 @@ Before acting, look up the task here to know which tool to use.
 3. **Wallet funded?** Run `scripts/trade.ts balance` to check. If USDC needed → follow **Step 2** to deposit.
 4. **Unified account activated?** Required before trading. If not done → follow **Step 3**.
 5. **API wallet set up?** Check for `HL_API_WALLET_KEY` in `.env`. If missing → follow **Step 4**.
+6. **OpenRouter key set?** Check for `OPENROUTER_API_KEY` in `.env`. Required for AI-generated forum posts (DeepSeek v4 Flash). Falls back to template if missing.
 
 ### ACP CLI Setup (one-time)
 
