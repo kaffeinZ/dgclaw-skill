@@ -452,6 +452,13 @@ async function generatePostContent(prompt: string): Promise<string | null> {
   }
 }
 
+function validatePnL(aiContent: string, expectedPnL: string): boolean {
+  // Ensure AI response mentions the actual PnL (not hallucinated numbers)
+  // Look for the PnL value (e.g., "$12.15", "-$6.07", "+$12.15")
+  const cleanPnL = expectedPnL.replace('$', '').replace('+', '').trim();
+  return aiContent.includes(cleanPnL);
+}
+
 async function postToForum(title: string, content: string): Promise<void> {
   const apiKey = process.env.DGCLAW_API_KEY;
   if (!apiKey) {
@@ -569,9 +576,13 @@ async function checkStalePositions(
         const slTitle = `Closed ${tracked.symbol} ${tracked.direction} — ${realizedPnl !== null && realizedPnl >= 0 ? '+' : ''}${slPnlStr} | SL hit`;
         const slTemplate = `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — Stop Loss hit** | PnL: ${slPnlStr} | Held: ${heldH}h | Entry score: ${tracked.entryScore ?? '?'}/100`;
         const slPrompt = `You are a crypto perp trader posting a trade close on a forum. Write 2-3 natural sentences about this stop loss exit. Be honest and brief.\n\nTrade: ${tracked.direction.toUpperCase()} ${tracked.symbol} | PnL: ${slPnlStr} | Held: ${heldH}h | Entry score: ${tracked.entryScore ?? '?'}/100 | Stop loss triggered.`;
+        console.log(`LLM_PROMPT | SL exit | symbol=${tracked.symbol} | PnL=${slPnlStr} | prompt_length=${slPrompt.length}`);
         try {
           const aiContent = await generatePostContent(slPrompt);
-          await postToForum(slTitle, aiContent ?? slTemplate);
+          console.log(`LLM_RESPONSE | ${aiContent ? `${aiContent.substring(0, 60)}...` : 'null'}`);
+          const aiResponse = aiContent && validatePnL(aiContent, slPnlStr) ? aiContent : slTemplate;
+          console.log(`FORUM_POST | used=${aiContent && validatePnL(aiContent, slPnlStr) ? 'AI' : 'TEMPLATE'}`);
+          await postToForum(slTitle, aiResponse);
         } catch {
           await postToForum(slTitle, slTemplate).catch(() => {});
         }
@@ -594,7 +605,9 @@ async function checkStalePositions(
           const revPrompt = `You are a crypto perp trader posting a trade close on a forum. Write 2-3 natural sentences about this signal reversal exit. Be honest and brief.\n\nTrade: ${tracked.direction.toUpperCase()} ${tracked.symbol} | PnL: ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Held: ${ageH}h | Entry score: ${tracked.entryScore}/100 | Opposing ${oppositeDir} signal scored ${reversalScore} — momentum reversed.`;
           try {
             const aiContent = await generatePostContent(revPrompt);
-            await postToForum(revTitle, aiContent ?? revTemplate);
+            const revPnLStr = unrealizedPnl >= 0 ? `+$${unrealizedPnl.toFixed(4)}` : `-$${Math.abs(unrealizedPnl).toFixed(4)}`;
+            const aiResponse = aiContent && validatePnL(aiContent, revPnLStr) ? aiContent : revTemplate;
+            await postToForum(revTitle, aiResponse);
           } catch {
             await postToForum(revTitle, revTemplate).catch(() => {});
           }
