@@ -100,24 +100,59 @@ skills:
 
 The scanner (`scripts/scanner.ts`) runs every 15 minutes, scans all Hyperliquid perp assets within the OI range ($0.5M–$30M, majors excluded), and opens up to 5 concurrent positions.
 
-### Entry criteria (all must pass)
+### Entry criteria (current)
 
-1. **OBV rising** — at least 3 of the last 5 OBV steps must be rising (hard gate, not scored)
-2. **MA50 directional gate** — no longs below the 50-period MA, no shorts above it (hard gate, not scored)
-3. **RSI hard gate** — longs blocked if RSI > 75; shorts blocked if RSI < 25. Prevents disaster counter-trend entries.
-4. **Minimum score ≥ 60** — from the scoring system below
+**Rules (tiered):**
 
-> Candle pattern (2 same-direction candles) is **scored only** (10–15pts) — not a hard gate. A strong RSI + OBV + volume setup can enter without a perfect candle pattern.
+**Normal entries (score ≥ 60):**
+1. Price movement <15% in last 1h (avoids chasing pumps/dumps)
+2. MA50 clearly above/below MA200 (LONGs need MA50>MA200, SHORTs need MA50<MA200)
+
+**Reversal entries at MA50/MA200 crossover (score ≥ 65):**
+1. MA50 within 2% of MA200 (crossover zone — potential reversal)
+2. Score ≥ 65 (high conviction required for reversal trades)
+3. All other gates apply (15% move, etc.)
+
+**Summary:** Lower barrier (60) for clear trend trades; higher bar (65) for risky reversal plays at crossover.
+
+---
+
+### Entry criteria (previous strategy — v1, with hard gates)
+
+**If you want to revert**, restore these lines in scanner.ts after the score check:
+```typescript
+if (r.direction === 'long'  && r.rsi > 75) return false;
+if (r.direction === 'short' && r.rsi < 25) return false;
+if (r.ma50 !== null) {
+  if (r.direction === 'long' && r.lastClose < r.ma50) return false;
+  if (r.direction === 'short' && r.lastClose > r.ma50) return false;
+}
+// Note: OBV hard gate was also removed. To restore: if (!r.signals.obv) return false;
+```
+
+**Old gates (removed):**
+1. **OBV rising** — required ≥3 of last 5 steps rising (hard gate)
+2. **MA50 directional** — no longs below MA50, no shorts above it (hard gate)
+3. **RSI hard gate** — longs blocked if RSI > 75; shorts if RSI < 25 (hard gate)
+4. **Minimum score ≥ 60** — still in place
+
+**Why removed:** 
+- OBV, RSI, and MA50 were already in the scoring system (0-15 pts each)
+- Hard gates blocked high-score entries (OP 69, S 60, LINEA 68) on technical grounds when signals were strong
+- Score system already penalizes weak signals naturally — gates were redundant
+- Result: LINEA SHORT (68/100) entered immediately; previously would have failed MA50 gate despite high score
+
+---
 
 ### Scoring system (max ~95 pts)
 
 | Component | Max pts | How it scores |
 |-----------|---------|---------------|
-| RSI | 15 | Longs: `15 - abs(RSI - 45) × 0.4` — peaks at RSI=45 (15pts), still 9pts at RSI=30 or RSI=60, tapering to 0 near extremes. Shorts: `15 - abs(RSI - 55) × 0.4` — peaks at RSI=55. Rewards both oversold bounces and healthy momentum entries in either direction. |
+| RSI | 15 | Longs: `15 - abs(RSI - 30) × 0.25` — peaks at RSI=30 (oversold, 15pts), still 10pts at RSI=0, tapers to 0 above RSI=60. Shorts: `15 - abs(RSI - 70) × 0.25` — peaks at RSI=70 (overbought, 15pts), still 10pts at RSI=100, tapers to 0 below RSI=40. Balanced thresholds for fair treatment of both directions. |
 | OBV strength | 15 | 0pts at 1/5 rising, 7.5pts at 3/5, 15pts at 5/5. Rewards strong buying/selling pressure. |
-| Candle pattern | 10–15 | 10pts for 2 same-direction candles (the entry requirement). +5pts bonus (15 total) if a bullish/bearish engulfing pattern also coincides. Engulfing alone cannot trigger entry. |
-| Price vs VWAP | 15 | Symmetric: price AT VWAP = 15pts. For longs: within 5% above VWAP still scores (rewards pullback entries in a pump); beyond 5% above = 0pts. For shorts: mirror. No longer penalises longs just because the market is trending up. |
-| Volume build | **20** | Recent 3-candle avg vs prior 3-candle avg. **Strongest win predictor** — raised from 15pts. Needs 3× ratio to max out. LDO loss (vol 0.96x) scores 0; kBONK win (vol 25x) scores 20. |
+| Candle pattern | 10–20 | 10pts for 2 same-direction candles (green for long, red for short). +10pts additional if bullish/bearish engulfing pattern also present. Max 20pts if both conditions met. Candles are scored only — not a hard requirement (can enter without them if other signals are strong). |
+| Price vs VWAP | 0–15 | 5-category scale: LONG: 15pts @ -2.5% (ideal pullback), 12pts @ 0% (at VWAP), 7.5pts @ +2.5%, 2.5pts @ +5%, 0pts @ +10%+. SHORT: mirrored (rewards price above VWAP). Each category has distinct points; no compression to the extremes. |
+| Volume build | 0–20 | Recent 3-candle avg vs prior 3-candle avg. **Only awarded if OBV confirms direction** (LONG: OBV rising, SHORT: OBV falling). Scoring: 1.0–3.0x = scales 0–15pts, 3.0–5.0x = 15pts, 5.0x+ = 20pts max. Prevents rewarding high volume on wrong-direction candles. |
 | MA50 > MA200 | +5 | Bonus when the 50 MA is above the 200 MA (bull trend for longs) or below (bear trend for shorts). |
 | Golden/death cross | +10 | Bonus when the 50 MA just crossed the 200 MA in the signal direction. |
 
@@ -129,16 +164,19 @@ No time-based exits. All exits are signal or price driven.
 
 | Exit type | Condition |
 |-----------|-----------|
-| **SL** | Fixed at entry: candle low/high ± 0.5% buffer. Min **4%**, max **8%** (trade skipped if candle structure requires >8%). |
-| **Trailing stop** | Activates once price moves ≥ 1× SL distance in our favour (breakeven locked). Trails the peak price by **0.5× SL distance** — tighter trail locks profit quickly. No TP ceiling — winners run. |
+| **Fixed SL** | Fixed at entry: candle low/high ± 0.5% buffer. Min **6%**, max **8%** (trade skipped if SL would be <6% or >8%). Filters for well-defined support levels. Triggers when price hits the fixed stop. Logged as "Stop Loss hit" if loss. |
+| **Trailing stop** | **Stepped trailing system:** Activates at +1R (when price moves 1× SL distance in our favor). Hard floor at breakeven — never goes back. Trails peak by **0.1R** (10% of risk). Locks profit in increments: +1R → +1.5R → +2R → +2.5R... as price rises. Example: 6% SL = trail by 0.6%, hard floor at entry. Designed for 24h scalping before trend reversal. Logged as "Trailing stop locked" if profit. |
 | **Reversal exit** | Every 15m scan: checks if the opposing signal now scores **higher than the entry score** on the same 15m timeframe. If yes → market close. Minimum 2h hold before reversal can fire. Exits when the market genuinely turns, not on noise. |
 
-**How the math works (example — SL 5%):**
-- Entry $1.00 → SL $0.95 (-5%)
-- Trailing activates at $1.05 (+5%) → stop moves to $1.00 (breakeven)
-- At $1.10 → stop at $1.075 (+7.5% locked)
-- At $1.20 → stop at $1.175 (+17.5% locked)
-- No TP — trade runs until trailing stop or reversal fires
+**How the stepped trailing works (example — SL 6%):**
+- Entry $1.00 → SL $0.94 (risk = $0.06 = 1R)
+- Price → $1.066 (+1R = +6%) → **Trailing activates, TS = $1.00 (hard floor, breakeven locked)**
+- Price → $1.096 (+1.6R) → **TS = $1.090 (trails by 0.6¢ = 0.1R below peak)**
+- Price → $1.126 (+2.1R) → **TS = $1.120 (locks +12¢ = +2R profit)**
+- Price → $1.156 (+2.6R) → **TS = $1.150 (locks +15¢ = +2.5R profit)**
+- Price reverses to $1.120 → **TS hit, exit with ~+2R profit ✓**
+
+Hard floor = never below entry. Trail = 0.1R below peak. Locks profit in ~0.5R steps. Realistically exits 24h window.
 
 **Why this replaced time exits:**
 - 8h/16h/24h exits were cutting 33 trades for -$22.88 on slow bleeds that never hit SL

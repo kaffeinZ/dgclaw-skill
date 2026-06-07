@@ -9,8 +9,8 @@ const LEVERAGE_LOW = 3;          // OI $500K–$5M
 const LEVERAGE_HIGH = 5;         // OI $5M–$30M
 const OI_LEVERAGE_THRESHOLD = 5_000_000;
 const MAX_POSITIONS = 5;
-const MIN_SL_PCT = 0.04; // minimum SL — below 15m noise floor
-const MAX_SL_PCT = 0.08; // skip trade if SL wider than 8% — too risky
+const MIN_SL_PCT = 0.06; // minimum SL — skip trades with tighter supports (weak structure)
+const MAX_SL_PCT = 0.08; // maximum SL — skip trades wider than 8% (high volatility)
 const SL_BUFFER = 0.005; // 0.5% buffer beyond candle low/high
 const OI_MIN_USD = 500_000;
 const OI_MAX_USD = 30_000_000;
@@ -44,6 +44,7 @@ interface PositionEntry {
   entrySignal?: 'greenCandles' | 'redCandles' | 'goldenCross' | 'deathCross' | 'none';
   entryScore?: number;
   entryPrice?: number;
+  entryHourlyMovePct?: number;  // price move % at entry time (for monitoring gate effectiveness)
   slPct?: number;
   slPrice?: number;    // current SL price — updated as trailing stop moves it
   trailingActive?: boolean;
@@ -55,7 +56,7 @@ interface TradeLogEntry {
   direction: 'long' | 'short';
   openTime: number;
   closeTime: number;
-  closeReason: 'tp_or_sl' | 'signal_reversal' | 'trailing_stop';
+  closeReason: 'fixed_sl' | 'trailing_stop' | 'signal_reversal';
   entryScore?: number;
   pnlUsd: number | null; // null for external tp/sl closes
   entrySignal: string;
@@ -292,12 +293,13 @@ function calcStrengthScore(
 ): number {
   let score = 0;
 
-  // RSI proximity (0–15 pts): peak at RSI=45 (long) / RSI=55 (short) — rewards both oversold
-  // bounces and healthy momentum entries; tapers smoothly toward extremes.
+  // RSI proximity (0–15 pts): peak at RSI=30 (long oversold) / RSI=70 (short overbought)
+  // LONG: max 15pts at RSI 30 (oversold), still 10pts at RSI 0, tapers to 0 above RSI 60
+  // SHORT: max 15pts at RSI 70 (overbought), still 10pts at RSI 100, tapers to 0 below RSI 40
   if (direction === 'long') {
-    score += Math.max(0, Math.min(15, 15 - Math.abs(rsi - 45) * 0.4));
+    score += Math.max(0, Math.min(15, 15 - Math.abs(rsi - 30) * 0.25));
   } else {
-    score += Math.max(0, Math.min(15, 15 - Math.abs(rsi - 55) * 0.4));
+    score += Math.max(0, Math.min(15, 15 - Math.abs(rsi - 70) * 0.25));
   }
 
   // OBV (0–15 pts): 3.75 pts at 3/5, 11.25 pts at 4/5, 15 pts at 5/5
@@ -313,19 +315,49 @@ function calcStrengthScore(
     if (bearishEngulfing) score += 10;
   }
 
-  // Price vs VWAP (0–15 pts): symmetric — rewards entries within 5% of VWAP on either side.
-  // Price AT VWAP = 15pts (ideal pullback). Extended >5% above/below = 0pts.
+  // Price vs VWAP (0–15 pts): 5-category scale: 15 @ -2.5%, 12 @ 0%, 7.5 @ +2.5%, 2.5 @ +5%, 0 @ +10%+
+  // Two-piece formula to hit exact breakpoints
   if (vwap > 0) {
     const vwapDist = (lastClose - vwap) / vwap;
+    let vwapScore = 0;
+
     if (direction === 'long') {
-      score += Math.min(15, Math.max(0, (0.05 - vwapDist) * 300));
+      // LONG: rewards price below VWAP (pullback entry)
+      if (vwapDist <= 0.05) {
+        // -2.5% to +5%: from 15 pts down to 2.5 pts
+        vwapScore = 15 - (vwapDist + 0.025) * 166.67;
+      } else {
+        // +5% to +10%+: from 2.5 pts down to 0
+        vwapScore = Math.max(0, 2.5 - (vwapDist - 0.05) * 50);
+      }
     } else {
-      score += Math.min(15, Math.max(0, (vwapDist + 0.05) * 300));
+      // SHORT: rewards price above VWAP (pullback entry for shorts)
+      if (vwapDist >= -0.05) {
+        // +2.5% to -5%: from 15 pts down to 2.5 pts (mirrored)
+        vwapScore = 15 - (-vwapDist + 0.025) * 166.67;
+      } else {
+        // -5% to -10%+: from 2.5 pts down to 0
+        vwapScore = Math.max(0, 2.5 - (-vwapDist - 0.05) * 50);
+      }
     }
+    score += Math.min(15, Math.max(0, vwapScore));
   }
 
-  // Volume build (0–20 pts): strongest win predictor. Needs 3× ratio to max out.
-  score += Math.min(20, Math.max(0, (volumeBuildRatio - 1.0) * 10));
+  // Volume build (0–20 pts): only award if OBV confirms direction (gated)
+  // Scoring: 1.0-3.0x = scales 0-15pts, 3.0-5.0x = 15pts, 5.0x+ = 20pts max
+  // OBV: >=3/5 steps rising = obvRising for longs, <3/5 = obvRising for shorts
+  const obvRising = obvRisingCount >= 3;
+  let volumeScore = 0;
+  if (direction === 'long' && obvRising) {
+    if (volumeBuildRatio < 3.0) volumeScore = Math.max(0, (volumeBuildRatio - 1.0) * 10);
+    else if (volumeBuildRatio < 5.0) volumeScore = 15;
+    else volumeScore = 20;
+  } else if (direction === 'short' && !obvRising) {
+    if (volumeBuildRatio < 3.0) volumeScore = Math.max(0, (volumeBuildRatio - 1.0) * 10);
+    else if (volumeBuildRatio < 5.0) volumeScore = 15;
+    else volumeScore = 20;
+  }
+  score += volumeScore;
 
   // 50/200 double confirmation (+5 pts bonus)
   if (ma50 !== null && ma200 !== null) {
@@ -569,13 +601,29 @@ async function checkStalePositions(
         } catch {
           // ignore — pnlUsd stays null
         }
-        console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=SL_hit | PnL=${realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown'} | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'} | entryScore=${tracked.entryScore ?? '?'}`);
-        logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: 'tp_or_sl', pnlUsd: realizedPnl, entrySignal: tracked.entrySignal ?? 'unknown' });
+        // Distinguish between trailing stop (profit) and fixed SL (loss) based on P&L
+        const exitType = realizedPnl !== null && realizedPnl > 0 ? 'trailing_stop' : 'fixed_sl';
+        const exitLabel = exitType === 'trailing_stop' ? 'TRAILING_STOP' : 'FIXED_SL';
+        console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=${exitLabel} | PnL=${realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown'} | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'} | entryScore=${tracked.entryScore ?? '?'}`);
+
+        // Monitor: log which gates WOULD have blocked this trade (if loss)
+        if (realizedPnl !== null && realizedPnl < 0) {
+          const blockedBy = [];
+          if (tracked.entryHourlyMovePct && Math.abs(tracked.entryHourlyMovePct) > 0.15) {
+            blockedBy.push(`hourly_move_${(tracked.entryHourlyMovePct * 100).toFixed(1)}%`);
+          }
+          if (blockedBy.length > 0) {
+            console.log(`  ⚠️ GATE_ANALYSIS | This loss would have blocked by: [${blockedBy.join(', ')}]`);
+          }
+        }
+        logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: exitType, pnlUsd: realizedPnl, entrySignal: tracked.entrySignal ?? 'unknown', entryScore: tracked.entryScore });
         const heldH = ((Date.now() - tracked.openTime) / 3_600_000).toFixed(1);
         const slPnlStr = realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown';
-        const slTitle = `Closed ${tracked.symbol} ${tracked.direction} — ${realizedPnl !== null && realizedPnl >= 0 ? '+' : ''}${slPnlStr} | SL hit`;
-        const slTemplate = `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — Stop Loss hit** | PnL: ${slPnlStr} | Held: ${heldH}h | Entry score: ${tracked.entryScore ?? '?'}/100`;
-        const slPrompt = `You are a crypto perp trader posting a trade close on a forum. Write 2-3 natural sentences about this stop loss exit. Be honest and brief.\n\nTrade: ${tracked.direction.toUpperCase()} ${tracked.symbol} | PnL: ${slPnlStr} | Held: ${heldH}h | Entry score: ${tracked.entryScore ?? '?'}/100 | Stop loss triggered.`;
+        const isTrailingStop = realizedPnl !== null && realizedPnl > 0;
+        const exitTypeLabel = isTrailingStop ? 'Trailing stop locked' : 'Stop Loss hit';
+        const slTitle = `Closed ${tracked.symbol} ${tracked.direction} — ${realizedPnl !== null && realizedPnl >= 0 ? '+' : ''}${slPnlStr} | ${exitTypeLabel}`;
+        const slTemplate = `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — ${exitTypeLabel}** | PnL: ${slPnlStr} | Held: ${heldH}h | Entry score: ${tracked.entryScore ?? '?'}/100`;
+        const slPrompt = `You are a crypto perp trader posting a trade close on a forum. Write 2-3 natural sentences about this ${isTrailingStop ? 'trailing stop' : 'stop loss'} exit. Be honest and brief.\n\nTrade: ${tracked.direction.toUpperCase()} ${tracked.symbol} | PnL: ${slPnlStr} | Held: ${heldH}h | Entry score: ${tracked.entryScore ?? '?'}/100 | ${isTrailingStop ? 'Trailing stop locked profit.' : 'Stop loss triggered.'}`;
         console.log(`LLM_PROMPT | SL exit | symbol=${tracked.symbol} | PnL=${slPnlStr} | prompt_length=${slPrompt.length}`);
         try {
           const aiContent = await generatePostContent(slPrompt);
@@ -670,15 +718,17 @@ async function checkStalePositions(
 
           if (!tracked.trailingActive && moveInFavour >= slDistance) {
             tracked.trailingActive = true;
-            console.log(`TRAIL | ${tracked.symbol} ${tracked.direction.toUpperCase()} | ACTIVATED at ${midPrice.toPrecision(5)} (+${(moveInFavour / tracked.entryPrice * 100).toFixed(1)}% from entry ${tracked.entryPrice}) | SL moves to breakeven`);
+            console.log(`TRAIL | ${tracked.symbol} ${tracked.direction.toUpperCase()} | ACTIVATED at +1R | SL locked at breakeven (hard floor — never goes below entry)`);
           }
 
           if (tracked.trailingActive) {
-            // New SL trails peak by 0.5× SL distance — locks profit quickly
-            const trailDistance = slDistance * 0.5;
+            // Stepped trailing: SL trails peak by 0.1R, hard floor at breakeven (entry price)
+            // Locks profit in increments: +1R → +1.5R → +2R → +2.5R... as price rises
+            const trailDistance = slDistance * 0.1; // Trail by 10% of risk below peak
+            const hardFloor = tracked.entryPrice; // Breakeven — never go below
             const newSlPrice = isLong
-              ? tracked.peakPrice! - trailDistance
-              : tracked.peakPrice! + trailDistance;
+              ? Math.max(tracked.peakPrice! - trailDistance, hardFloor)
+              : Math.min(tracked.peakPrice! + trailDistance, hardFloor);
 
             // Only update if SL has improved by >0.2% (avoid order spam)
             const currentSl = tracked.slPrice ?? 0;
@@ -856,21 +906,35 @@ async function main() {
   // Candle pattern is scored only — not a hard gate
   // EXCEPTION: golden/death cross bypasses ALL gates and enters as priority
   const MIN_ENTRY_SCORE = 60;
+  const REVERSAL_ENTRY_SCORE = 65; // Higher bar for MA50/MA200 crossover entries
+  const MA_CROSSOVER_PCT = 0.02; // MA50 within 2% of MA200 = potential crossover zone
+  const MAX_HOURLY_MOVE_PCT = 0.15; // Skip if price moved >15% in last 1h (pump/dump trap)
   const seen = new Set<string>();
   const eligible = allResults.filter(r => {
     if (openCoins.has(r.symbol.toUpperCase())) return false;
     if (seen.has(r.symbol)) return false;
     seen.add(r.symbol);
-    // Golden/death cross: priority entry — bypass all hard gates and score
-    if (r.isCross) return true;
-    // Normal entry gates
-    if (!r.signals.obv) return false;
+    // Score is the only gate
     if (r.score < MIN_ENTRY_SCORE) return false;
-    if (r.direction === 'long'  && r.rsi > 75) return false;
-    if (r.direction === 'short' && r.rsi < 25) return false;
-    if (r.ma50 !== null) {
-      if (r.direction === 'long' && r.lastClose < r.ma50) return false;
-      if (r.direction === 'short' && r.lastClose > r.ma50) return false;
+    // Skip if price moved >15% in last 1h (already ran, late entry trap) — applies to all entries
+    if (Math.abs(r.candleMovePct) > MAX_HOURLY_MOVE_PCT) return false;
+    // Trend filter: LONGs need MA50>MA200, SHORTs need MA50<MA200
+    // BUT: allow reversal entries at crossover (MA50 within 2% of MA200) if score ≥ 65
+    if (r.ma50 !== null && r.ma200 !== null) {
+      const maDiff = Math.abs(r.ma50 - r.ma200) / r.ma200; // % distance between MAs
+      const atCrossover = maDiff < MA_CROSSOVER_PCT;
+
+      if (r.direction === 'long') {
+        if (r.ma50 < r.ma200) {
+          // Bear trend: only allow if at crossover + high score (reversal entry)
+          if (!atCrossover || r.score < REVERSAL_ENTRY_SCORE) return false;
+        }
+      } else if (r.direction === 'short') {
+        if (r.ma50 > r.ma200) {
+          // Bull trend: only allow if at crossover + high score (reversal entry)
+          if (!atCrossover || r.score < REVERSAL_ENTRY_SCORE) return false;
+        }
+      }
     }
     return true;
   });
@@ -894,7 +958,7 @@ async function main() {
   });
 
   if (eligible.length === 0) {
-    console.log(`\nNo asset met entry criteria (OBV hard gate, RSI gates, 50 MA gate, score≥${MIN_ENTRY_SCORE}) — no trade`);
+    console.log(`\nNo asset met entry criteria (score≥${MIN_ENTRY_SCORE}) — no trade`);
     return;
   }
 
@@ -1040,6 +1104,7 @@ async function main() {
         entrySignal: (best as any).entrySignal,
         entryScore: best.score,
         entryPrice,
+        entryHourlyMovePct: best.candleMovePct,
         slPct,
         slPrice: parseFloat(slPrice),
         trailingActive: false,
