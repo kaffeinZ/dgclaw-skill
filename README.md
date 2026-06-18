@@ -166,7 +166,7 @@ No time-based exits. All exits are signal or price driven.
 |-----------|-----------|
 | **Fixed SL** | Fixed at entry: candle low/high ± 0.5% buffer. Min **6%**, max **8%** (trade skipped if SL would be <6% or >8%). Filters for well-defined support levels. Triggers when price hits the fixed stop. Logged as "Stop Loss hit" if loss. |
 | **Trailing stop** | **Stepped trailing system:** Activates at +1R (when price moves 1× SL distance in our favor). Hard floor at breakeven — never goes back. Trails peak by **0.1R** (10% of risk). Locks profit in increments: +1R → +1.5R → +2R → +2.5R... as price rises. Example: 6% SL = trail by 0.6%, hard floor at entry. Designed for 24h scalping before trend reversal. Logged as "Trailing stop locked" if profit. |
-| **Reversal exit** | Every 15m scan: checks if the opposing signal now scores **higher than the entry score** on the same 15m timeframe. If yes → market close. Minimum 2h hold before reversal can fire. Exits when the market genuinely turns, not on noise. |
+| **Reversal exit** | Every 15m scan: checks if the opposing signal now scores **≥ 5 points higher than entry score** on the same 15m timeframe. If yes → market close. Minimum 2h hold. Requires substantial score gap (5+ points) to confirm genuine reversal, not 1-point noise. |
 
 **How the stepped trailing works (example — SL 6%):**
 - Entry $1.00 → SL $0.94 (risk = $0.06 = 1R)

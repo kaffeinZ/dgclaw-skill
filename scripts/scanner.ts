@@ -1,7 +1,47 @@
 import 'dotenv/config';
 import fs from 'fs';
-import { privateKeyToAccount } from 'viem/accounts';
+import { execSync } from 'child_process';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { HttpTransport, ExchangeClient, InfoClient } from '@nktkas/hyperliquid';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ACP_DIR = process.env.ACP_CLI_DIR || resolve(__dirname, '..', '..', 'acp-cli');
+
+function getAcpBin(): string {
+  return `npx tsx ${resolve(ACP_DIR, 'bin', 'acp.ts')}`;
+}
+
+function derivePrimaryType(types: Record<string, any>): string {
+  const keys = Object.keys(types).filter(k => k !== 'EIP712Domain');
+  return keys[0] ?? '';
+}
+
+function makeAcpWallet(masterAddress: string) {
+  const acp = getAcpBin();
+  return {
+    async getAddress(): Promise<string> {
+      return masterAddress;
+    },
+    async signTypedData(domain: any, types: any, message: any): Promise<string> {
+      const typedData = { domain, types, primaryType: derivePrimaryType(types), message };
+      try {
+        const result = execSync(
+          `${acp} wallet sign-typed-data --data '${JSON.stringify(typedData)}' --json`,
+          { encoding: 'utf-8', cwd: ACP_DIR, stdio: ['pipe', 'pipe', 'pipe'] },
+        );
+        const parsed = JSON.parse(result);
+        const sig = parsed.signature ?? parsed.data?.signature ?? result.trim();
+        if (!sig) throw new Error('No signature in response: ' + result);
+        return sig;
+      } catch (err: any) {
+        const msg = err.stderr || err.stdout || err.message || String(err);
+        console.error('ACP signing failed:', msg);
+        throw err;
+      }
+    },
+  };
+}
 
 const HL_API_URL = 'https://api.hyperliquid.xyz';
 const MARGIN_PER_TRADE_USD = 10; // your capital at risk per trade (before leverage)
@@ -642,10 +682,11 @@ async function checkStalePositions(
 
       // Reversal exit — check if opposing 15m signal now scores > entry score (min 2h hold)
       const MIN_HOLD_REVERSAL_MS = 2 * 60 * 60 * 1000;
+      const MIN_REVERSAL_SCORE_GAP = 5; // Require 5+ point gap to avoid noise exits
       if (tracked.entryScore && ageMs >= MIN_HOLD_REVERSAL_MS) {
         const oppositeDir = tracked.direction === 'long' ? 'short' : 'long';
         const reversalScore = await getReversalScore(tracked.symbol, oppositeDir);
-        if (reversalScore > tracked.entryScore) {
+        if (reversalScore > tracked.entryScore + MIN_REVERSAL_SCORE_GAP) {
           const unrealizedPnl = parseFloat((pos as any).unrealizedPnl ?? '0');
           console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=signal_reversal | PnL=$${unrealizedPnl.toFixed(4)} | entryScore=${tracked.entryScore} | reversalScore=${reversalScore} (${oppositeDir}) | held=${ageH}h | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'}`);
           const revTitle = `Closed ${tracked.symbol} ${tracked.direction} — ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Signal reversal`;
@@ -804,16 +845,14 @@ async function main() {
   process.on('SIGINT', () => { removeLock(); process.exit(0); });
   process.on('SIGTERM', () => { removeLock(); process.exit(0); });
 
-  const apiWalletKey = process.env.HL_API_WALLET_KEY;
   const masterAddress = process.env.HL_MASTER_ADDRESS;
 
-  if (!apiWalletKey) { console.error('HL_API_WALLET_KEY not set'); process.exit(1); }
   if (!masterAddress) { console.error('HL_MASTER_ADDRESS not set'); process.exit(1); }
 
-  const account = privateKeyToAccount(apiWalletKey as `0x${string}`);
+  const wallet = makeAcpWallet(masterAddress);
   const transport = new HttpTransport({ apiUrl: HL_API_URL });
   const info = new InfoClient({ transport });
-  const exchange = new ExchangeClient({ wallet: account, transport });
+  const exchange = new ExchangeClient({ wallet: wallet as any, transport });
 
   const paperEntry = process.argv.includes('--paper-entry');
   const dryRun = process.argv.includes('--dry-run') || paperEntry;

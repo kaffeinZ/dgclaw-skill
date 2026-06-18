@@ -1,6 +1,46 @@
 import 'dotenv/config';
-import { privateKeyToAccount } from 'viem/accounts';
+import { execSync } from 'child_process';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { HttpTransport, ExchangeClient, InfoClient } from '@nktkas/hyperliquid';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ACP_DIR = process.env.ACP_CLI_DIR || resolve(__dirname, '..', '..', 'acp-cli');
+
+function getAcpBin(): string {
+  return `npx tsx ${resolve(ACP_DIR, 'bin', 'acp.ts')}`;
+}
+
+function derivePrimaryType(types: Record<string, any>): string {
+  const keys = Object.keys(types).filter(k => k !== 'EIP712Domain');
+  return keys[0] ?? '';
+}
+
+function makeAcpWallet(masterAddress: string) {
+  const acp = getAcpBin();
+  return {
+    async getAddress(): Promise<string> {
+      return masterAddress;
+    },
+    async signTypedData(domain: any, types: any, message: any): Promise<string> {
+      const typedData = { domain, types, primaryType: derivePrimaryType(types), message };
+      try {
+        const result = execSync(
+          `${acp} wallet sign-typed-data --data '${JSON.stringify(typedData)}' --json`,
+          { encoding: 'utf-8', cwd: ACP_DIR, stdio: ['pipe', 'pipe', 'pipe'] },
+        );
+        const parsed = JSON.parse(result);
+        const sig = parsed.signature ?? parsed.data?.signature ?? result.trim();
+        if (!sig) throw new Error('No signature in response: ' + result);
+        return sig;
+      } catch (err: any) {
+        const msg = err.stderr || err.stdout || err.message || String(err);
+        console.error('ACP signing failed:', msg);
+        throw err;
+      }
+    },
+  };
+}
 
 // ---- Config ----
 
@@ -127,8 +167,14 @@ async function getAssetIndex(
   return { index: idx, meta: universe[idx] as AssetMeta };
 }
 
-function formatPrice(price: number, significantFigures: number = 5): string {
-  return price.toPrecision(significantFigures);
+function formatPrice(price: number): string {
+  const sigFigs = Number(price.toPrecision(5));
+  const str = sigFigs.toString();
+  const dot = str.indexOf('.');
+  if (dot !== -1 && str.length - dot - 1 > 6) {
+    return sigFigs.toFixed(6);
+  }
+  return str;
 }
 
 function formatSize(usdSize: number, price: number, szDecimals: number): string {
@@ -272,7 +318,9 @@ async function closePosition(
 
   // Market close with 1% slippage
   const mids = await info.allMids();
-  const midPrice = parseFloat(mids[args.pair!.toUpperCase()]);
+  const midsAny = mids as any;
+  const pairKey = Object.keys(midsAny).find((k: string) => k.toUpperCase() === args.pair!.toUpperCase()) ?? args.pair!.toUpperCase();
+  const midPrice = parseFloat(midsAny[pairKey]);
   const slippage = isBuy ? 1.01 : 0.99;
   const orderPrice = formatPrice(midPrice * slippage);
 
@@ -455,25 +503,19 @@ async function showTickers(info: InfoClient) {
 async function main() {
   const args = parseArgs();
 
-  const apiWalletKey = process.env.HL_API_WALLET_KEY;
   const masterAddress = process.env.HL_MASTER_ADDRESS;
 
-  if (!apiWalletKey) {
-    console.error('HL_API_WALLET_KEY not set. Run scripts/add-api-wallet.ts first.');
-    process.exit(1);
-  }
   if (!masterAddress) {
-    console.error('HL_MASTER_ADDRESS not set. Set it to your ACP agent wallet address.');
-    console.error('  Find it with: acp whoami --json');
+    console.error('HL_MASTER_ADDRESS not set.');
     process.exit(1);
   }
 
-  const account = privateKeyToAccount(apiWalletKey as `0x${string}`);
+  const wallet = makeAcpWallet(masterAddress);
 
-  const transport = new HttpTransport({ url: HL_API_URL });
+  const transport = new HttpTransport({ apiUrl: HL_API_URL });
   const info = new InfoClient({ transport });
   const exchange = new ExchangeClient({
-    wallet: account,
+    wallet: wallet as any,
     transport,
   });
 
