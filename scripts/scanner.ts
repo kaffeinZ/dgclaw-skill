@@ -108,6 +108,7 @@ interface TradeLog {
 
 interface ScannerState {
   positions: PositionEntry[];
+  slCooldowns?: Record<string, number>; // symbol -> timestamp when cooldown expires
 }
 
 interface Candle {
@@ -646,15 +647,12 @@ async function checkStalePositions(
         const exitLabel = exitType === 'trailing_stop' ? 'TRAILING_STOP' : 'FIXED_SL';
         console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=${exitLabel} | PnL=${realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown'} | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'} | entryScore=${tracked.entryScore ?? '?'}`);
 
-        // Monitor: log which gates WOULD have blocked this trade (if loss)
-        if (realizedPnl !== null && realizedPnl < 0) {
-          const blockedBy = [];
-          if (tracked.entryHourlyMovePct && Math.abs(tracked.entryHourlyMovePct) > 0.15) {
-            blockedBy.push(`hourly_move_${(tracked.entryHourlyMovePct * 100).toFixed(1)}%`);
-          }
-          if (blockedBy.length > 0) {
-            console.log(`  ⚠️ GATE_ANALYSIS | This loss would have blocked by: [${blockedBy.join(', ')}]`);
-          }
+        // On FIXED_SL (loss): block re-entry on this symbol for 48h
+        if (exitType === 'fixed_sl') {
+          if (!state.slCooldowns) state.slCooldowns = {};
+          const cooldownUntil = Date.now() + 48 * 3_600_000;
+          state.slCooldowns[tracked.symbol.toUpperCase()] = cooldownUntil;
+          console.log(`  SL_BLOCK | ${tracked.symbol} blocked for 48h (until ${new Date(cooldownUntil).toISOString()})`);
         }
         logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: exitType, pnlUsd: realizedPnl, entrySignal: tracked.entrySignal ?? 'unknown', entryScore: tracked.entryScore });
         const heldH = ((Date.now() - tracked.openTime) / 3_600_000).toFixed(1);
@@ -949,12 +947,28 @@ async function main() {
   const MA_CROSSOVER_PCT = 0.02; // MA50 within 2% of MA200 = potential crossover zone
   const MAX_HOURLY_MOVE_PCT = 0.15; // Skip if price moved >15% in last 1h (pump/dump trap)
   const seen = new Set<string>();
+  // Purge expired SL cooldowns
+  const now = Date.now();
+  if (scanState.slCooldowns) {
+    for (const sym of Object.keys(scanState.slCooldowns)) {
+      if (scanState.slCooldowns[sym] <= now) delete scanState.slCooldowns[sym];
+    }
+  }
+
   const eligible = allResults.filter(r => {
     if (openCoins.has(r.symbol.toUpperCase())) return false;
     if (seen.has(r.symbol)) return false;
     seen.add(r.symbol);
-    // Score is the only gate
+    // Block symbols on SL cooldown (48h after FIXED_SL)
+    if (scanState.slCooldowns?.[r.symbol.toUpperCase()] && scanState.slCooldowns[r.symbol.toUpperCase()] > now) {
+      const remainH = ((scanState.slCooldowns[r.symbol.toUpperCase()] - now) / 3_600_000).toFixed(1);
+      console.log(`  SKIP ${r.symbol} — SL cooldown (${remainH}h remaining)`);
+      return false;
+    }
+    // Score gate
     if (r.score < MIN_ENTRY_SCORE) return false;
+    // Vol ratio gate — require meaningful volume build (not just noise)
+    if (r.volumeBuildRatio < 3.0) return false;
     // Skip if price moved >15% in last 1h (already ran, late entry trap) — applies to all entries
     if (Math.abs(r.candleMovePct) > MAX_HOURLY_MOVE_PCT) return false;
     // Trend filter: LONGs need MA50>MA200, SHORTs need MA50<MA200
