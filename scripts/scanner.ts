@@ -109,6 +109,7 @@ interface TradeLog {
 interface ScannerState {
   positions: PositionEntry[];
   slCooldowns?: Record<string, number>; // symbol -> timestamp when cooldown expires
+  oiSnapshots?: Record<string, number>; // symbol -> OI in USD at last scan
 }
 
 interface Candle {
@@ -134,6 +135,8 @@ interface SignalResult {
   slPrice: number;
   candleMovePct: number;
   oiUsd: number;
+  funding: number;
+  oiDeltaPct: number | null; // % change in OI since last scan, null if no prior snapshot
   leverage: number;
   lastClose: number;
   ma50: number | null;
@@ -210,6 +213,8 @@ async function analyzeAsset(
   szDecimals: number,
   assetIndex: number,
   oiUsd: number,
+  funding: number,
+  oiDeltaPct: number | null,
   leverage: number,
 ): Promise<{ long: SignalResult | null; short: SignalResult | null }> {
   try {
@@ -308,8 +313,8 @@ async function analyzeAsset(
     const shortScore = calcStrengthScore('short', lastRSI, obvRisingCount, bullishEngulfing, bearishEngulfing, bothGreen, bothRed, vwap, lastClose, volumeBuildRatio, ma50, ma200, goldenCross, deathCross);
 
     return {
-      long: { symbol, direction: 'long', score: longScore, signals: longBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: longSLPrice, candleMovePct, oiUsd, leverage, lastClose, ma50, ma200, vwap, isCross: goldenCross },
-      short: { symbol, direction: 'short', score: shortScore, signals: shortBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: shortSLPrice, candleMovePct, oiUsd, leverage, lastClose, ma50, ma200, vwap, isCross: deathCross },
+      long: { symbol, direction: 'long', score: longScore, signals: longBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: longSLPrice, candleMovePct, oiUsd, funding, oiDeltaPct, leverage, lastClose, ma50, ma200, vwap, isCross: goldenCross },
+      short: { symbol, direction: 'short', score: shortScore, signals: shortBase, midPrice, rsi: lastRSI, volumeBuildRatio, szDecimals, assetIndex, slPrice: shortSLPrice, candleMovePct, oiUsd, funding, oiDeltaPct, leverage, lastClose, ma50, ma200, vwap, isCross: deathCross },
     };
   } catch {
     return { long: null, short: null };
@@ -897,7 +902,9 @@ async function main() {
   const [meta, assetCtxs]: [any, any[]] = await hlPost({ type: 'metaAndAssetCtxs' });
   const mids: Record<string, string> = await hlPost({ type: 'allMids' });
 
-  const candidates: Array<{ symbol: string; midPrice: number; szDecimals: number; assetIndex: number; oiUsd: number; leverage: number }> = [];
+  const candidates: Array<{ symbol: string; midPrice: number; szDecimals: number; assetIndex: number; oiUsd: number; funding: number; oiDeltaPct: number | null; leverage: number }> = [];
+
+  if (!scanState.oiSnapshots) scanState.oiSnapshots = {};
 
   for (let i = 0; i < meta.universe.length; i++) {
     const asset = meta.universe[i];
@@ -912,18 +919,26 @@ async function main() {
     const leverage = oiUsd >= OI_LEVERAGE_THRESHOLD ? LEVERAGE_HIGH : LEVERAGE_LOW;
     if ((asset.maxLeverage ?? 1) < leverage) continue;
 
-    candidates.push({ symbol, midPrice, szDecimals: asset.szDecimals, assetIndex: i, oiUsd, leverage });
+    const funding = parseFloat(ctx.funding ?? '0');
+    const prevOi = scanState.oiSnapshots[symbol.toUpperCase()];
+    const oiDeltaPct = prevOi != null && prevOi > 0 ? (oiUsd - prevOi) / prevOi : null;
+    scanState.oiSnapshots[symbol.toUpperCase()] = oiUsd;
+
+    candidates.push({ symbol, midPrice, szDecimals: asset.szDecimals, assetIndex: i, oiUsd, funding, oiDeltaPct, leverage });
   }
 
   console.log(`Scanning ${candidates.length} candidates (OI $${(OI_MIN_USD / 1e6).toFixed(1)}M–$${(OI_MAX_USD / 1e6).toFixed(0)}M, excl. majors)...`);
 
   const allResults: SignalResult[] = [];
   for (const c of candidates) {
-    const { long, short } = await analyzeAsset(c.symbol, c.midPrice, c.szDecimals, c.assetIndex, c.oiUsd, c.leverage);
+    const { long, short } = await analyzeAsset(c.symbol, c.midPrice, c.szDecimals, c.assetIndex, c.oiUsd, c.funding, c.oiDeltaPct, c.leverage);
     if (long) allResults.push(long);
     if (short) allResults.push(short);
     await sleep(SCAN_DELAY_MS);
   }
+
+  // Persist OI snapshots so delta is available next scan
+  saveState(scanState);
 
   // Sort: highest continuous score first; smallest candle move as tiebreaker (freshest entry)
   allResults.sort((a, b) => {
@@ -969,6 +984,17 @@ async function main() {
     if (r.score < MIN_ENTRY_SCORE) return false;
     // Vol ratio gate — require meaningful volume build (not just noise)
     if (r.volumeBuildRatio < 3.0) return false;
+    // Funding rate gate — skip crowded trades (paying to hold against the crowd)
+    // Funding is per-8h rate; >0.05% = crowded long, <-0.05% = crowded short
+    const FUNDING_THRESHOLD = 0.0005; // 0.05% per 8h
+    if (r.direction === 'long' && r.funding > FUNDING_THRESHOLD) {
+      console.log(`  SKIP ${r.symbol} LONG — funding too high (${(r.funding * 100).toFixed(4)}%/8h, crowded long)`);
+      return false;
+    }
+    if (r.direction === 'short' && r.funding < -FUNDING_THRESHOLD) {
+      console.log(`  SKIP ${r.symbol} SHORT — funding too negative (${(r.funding * 100).toFixed(4)}%/8h, crowded short)`);
+      return false;
+    }
     // Skip if price moved >15% in last 1h (already ran, late entry trap) — applies to all entries
     if (Math.abs(r.candleMovePct) > MAX_HOURLY_MOVE_PCT) return false;
     // Trend filter: LONGs need MA50>MA200, SHORTs need MA50<MA200
@@ -1093,7 +1119,9 @@ async function main() {
         ? (best.ma50 > best.ma200 ? 'bull(MA50>MA200)' : 'bear(MA50<MA200)')
         : 'unknown';
       const passedSignals2 = Object.entries(best.signals).filter(([, v]) => v).map(([k]) => k).join(', ');
-      console.log(`ENTRY | ${best.symbol} ${best.direction.toUpperCase()} | score=${best.score}/100 | RSI=${best.rsi.toFixed(1)} | vol=${best.volumeBuildRatio.toFixed(2)}x | VWAP=${vwapDistPct2}% | MA=${maAlign2}${best.isCross ? ' | CROSS=true' : ''} | signals=[${passedSignals2}] | entry=${entryPrice} | SL=${slPrice} (${(slPct * 100).toFixed(1)}%)`);
+      const oiDeltaStr = best.oiDeltaPct != null ? ` | OI_delta=${best.oiDeltaPct >= 0 ? '+' : ''}${(best.oiDeltaPct * 100).toFixed(2)}%` : '';
+      const fundingStr = ` | funding=${(best.funding * 100).toFixed(4)}%/8h`;
+      console.log(`ENTRY | ${best.symbol} ${best.direction.toUpperCase()} | score=${best.score}/100 | RSI=${best.rsi.toFixed(1)} | vol=${best.volumeBuildRatio.toFixed(2)}x | VWAP=${vwapDistPct2}% | MA=${maAlign2}${best.isCross ? ' | CROSS=true' : ''}${fundingStr}${oiDeltaStr} | signals=[${passedSignals2}] | entry=${entryPrice} | SL=${slPrice} (${(slPct * 100).toFixed(1)}%)`);
 
       if (paperEntry) {
         console.log(`  [PAPER ENTRY] Would set SL: ${slPrice} for size ${sz}`);

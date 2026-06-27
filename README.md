@@ -102,18 +102,22 @@ The scanner (`scripts/scanner.ts`) runs every 15 minutes, scans all Hyperliquid 
 
 ### Entry criteria (current)
 
-**Rules (tiered):**
-
-**Normal entries (score ≥ 60):**
-1. Price movement <15% in last 1h (avoids chasing pumps/dumps)
-2. MA50 clearly above/below MA200 (LONGs need MA50>MA200, SHORTs need MA50<MA200)
+**Hard gates (all must pass):**
+1. Score ≥ 60 (≥ 65 for reversal entries at MA crossover)
+2. Price movement < 15% in last 1h — no chasing pumps/dumps
+3. Volume build ratio ≥ 3× — meaningful momentum, not noise
+4. MA50 clearly above/below MA200 (LONGs: MA50>MA200, SHORTs: MA50<MA200)
+5. Funding rate within range — LONGs skipped if funding > +0.05%/8h (crowded long), SHORTs skipped if funding < -0.05%/8h (crowded short)
+6. SL cooldown — any symbol that hit a fixed SL is blocked from re-entry for 48h
 
 **Reversal entries at MA50/MA200 crossover (score ≥ 65):**
-1. MA50 within 2% of MA200 (crossover zone — potential reversal)
-2. Score ≥ 65 (high conviction required for reversal trades)
-3. All other gates apply (15% move, etc.)
+1. MA50 within 2% of MA200 (crossover zone)
+2. Score ≥ 65 (higher conviction required)
+3. All other gates still apply
 
-**Summary:** Lower barrier (60) for clear trend trades; higher bar (65) for risky reversal plays at crossover.
+**OI delta (logged, not yet gating):** Every entry logs the % change in open interest since the prior scan (15-min delta). Rising OI confirms real conviction behind a move; flat/falling OI suggests short covering or long liquidations. Data is being collected to determine threshold — not yet a hard gate.
+
+**Summary:** Clear trend trades need score 60+, vol 3×, non-crowded funding, and no recent SL on that symbol. Reversal plays at crossover need 65+.
 
 ---
 
