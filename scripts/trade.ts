@@ -167,12 +167,25 @@ async function getAssetIndex(
   return { index: idx, meta: universe[idx] as AssetMeta };
 }
 
-function formatPrice(price: number): string {
+// Hyperliquid perp prices must satisfy BOTH:
+//   - at most 5 significant figures
+//   - at most (6 - szDecimals) decimal places   <-- this half was previously missing
+// szDecimals is REQUIRED, not defaulted: a default of 0 gives maxDecimals=6, which is
+// exactly the defect this fixes, and would be silently exercised at any call site where
+// the value isn't in scope. Let the compiler enforce it instead.
+function formatPrice(price: number, szDecimals: number): string {
+  // Outside this range Number.toString() switches to exponential notation, which HL
+  // rejects. The decimal count below would also miscount exponent characters and
+  // collapse the price to "0.00000" — a zero-price order. Fail loudly instead.
+  if (!Number.isFinite(price) || Math.abs(price) < 1e-6 || Math.abs(price) >= 1e21) {
+    throw new Error(`formatPrice: ${price} outside formattable range (1e-6 .. 1e21)`);
+  }
+  const maxDecimals = Math.max(0, 6 - szDecimals);
   const sigFigs = Number(price.toPrecision(5));
   const str = sigFigs.toString();
   const dot = str.indexOf('.');
-  if (dot !== -1 && str.length - dot - 1 > 6) {
-    return sigFigs.toFixed(6);
+  if (dot !== -1 && str.length - dot - 1 > maxDecimals) {
+    return sigFigs.toFixed(maxDecimals);
   }
   return str;
 }
@@ -223,7 +236,7 @@ async function openPosition(
   } else {
     // Market order: use IoC with 1% slippage buffer
     const slippage = isBuy ? 1.01 : 0.99;
-    orderPrice = formatPrice(midPrice * slippage);
+    orderPrice = formatPrice(midPrice * slippage, meta.szDecimals);
     tif = 'Ioc';
   }
 
@@ -299,7 +312,9 @@ async function closePosition(
 ) {
   if (!args.pair) { console.error('--pair is required'); process.exit(1); }
 
-  const { index: assetId } = await getAssetIndex(info, args.pair);
+  // meta carries szDecimals, required by formatPrice. getAssetIndex exits on an
+  // unknown pair, so this cannot come back undefined and silently fall back.
+  const { index: assetId, meta } = await getAssetIndex(info, args.pair);
 
   // Get current position to determine size and side
   const state = await info.clearinghouseState({ user: masterAddress as `0x${string}` });
@@ -322,7 +337,7 @@ async function closePosition(
   const pairKey = Object.keys(midsAny).find((k: string) => k.toUpperCase() === args.pair!.toUpperCase()) ?? args.pair!.toUpperCase();
   const midPrice = parseFloat(midsAny[pairKey]);
   const slippage = isBuy ? 1.01 : 0.99;
-  const orderPrice = formatPrice(midPrice * slippage);
+  const orderPrice = formatPrice(midPrice * slippage, meta.szDecimals);
 
   console.log(`Closing ${args.pair} position — size: ${sz}, price: ${orderPrice}`);
 

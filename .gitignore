@@ -6,3 +6,17 @@ node_modules/
 *.log
 positions.json
 trade_log.json
+# local edit backups
+*.bak
+*.bak.*
+*.bak[0-9]*
+
+# runtime state
+.scanner.lock
+
+# signal harness: data + derived state, never source (see HARNESS-PREREG.md)
+signals.jsonl
+outcomes.jsonl
+harness/
+.harness_watermark
+.harness_study_start

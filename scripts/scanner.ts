@@ -63,6 +63,7 @@ const SCAN_DELAY_MS = 300;
 const STATE_FILE = new URL('../positions.json', import.meta.url).pathname;
 const TRADE_LOG_FILE = new URL('../trade_log.json', import.meta.url).pathname;
 const LOCK_FILE = new URL('../.scanner.lock', import.meta.url).pathname;
+const SIGNALS_FILE = new URL('../signals.jsonl', import.meta.url).pathname;
 
 const FORUM_BASE = 'https://degen.virtuals.io';
 const FORUM_AGENT_ID = '1026';
@@ -88,7 +89,8 @@ interface PositionEntry {
   slPct?: number;
   slPrice?: number;    // current SL price — updated as trailing stop moves it
   trailingActive?: boolean;
-  peakPrice?: number;  // highest price reached (longs) or lowest (shorts)
+  peakPrice?: number;   // best price reached: highest (longs) / lowest (shorts) — MFE tracker
+  troughPrice?: number; // worst price reached: lowest (longs) / highest (shorts) — MAE tracker
 }
 
 interface TradeLogEntry {
@@ -100,6 +102,20 @@ interface TradeLogEntry {
   entryScore?: number;
   pnlUsd: number | null; // null for external tp/sl closes
   entrySignal: string;
+  // --- excursion instrumentation (added 2026-08-02) ---
+  // `armed` is the first-class split: the trailing rule can only be blamed for trades
+  // where it actually engaged. Trades that touched +1R intra-bar without a 15-min scan
+  // seeing it, or that exited on reversal, are a DIFFERENT defect and must be analysed
+  // separately. Analysis that pools them cannot attribute cost to the trail.
+  armed?: boolean;         // did trailingActive ever become true
+  slPct?: number;          // 1R distance, so MFE/MAE can be expressed in R
+  // Scan-sampled: what the system could actually have acted on (15-min midPrice).
+  mfeScanPct?: number | null;
+  maeScanPct?: number | null;
+  // Candle-derived: what the market actually offered, including intra-bar.
+  // The gap between these two IS the sampling asymmetry, measured per trade.
+  mfeTruePct?: number | null;
+  maeTruePct?: number | null;
 }
 
 interface TradeLog {
@@ -418,13 +434,25 @@ function calcStrengthScore(
   return Math.round(score);
 }
 
-function formatPrice(price: number): string {
+// Hyperliquid perp prices must satisfy BOTH:
+//   - at most 5 significant figures
+//   - at most (6 - szDecimals) decimal places   <-- this half was previously missing
+// szDecimals is REQUIRED, not defaulted: a default of 0 gives maxDecimals=6, which is
+// exactly the defect this fixes, and would be silently exercised at any call site where
+// the value isn't in scope. Let the compiler enforce it instead.
+function formatPrice(price: number, szDecimals: number): string {
+  // Outside this range Number.toString() switches to exponential notation, which HL
+  // rejects. The decimal count below would also miscount exponent characters and
+  // collapse the price to "0.00000" — a zero-price order. Fail loudly instead.
+  if (!Number.isFinite(price) || Math.abs(price) < 1e-6 || Math.abs(price) >= 1e21) {
+    throw new Error(`formatPrice: ${price} outside formattable range (1e-6 .. 1e21)`);
+  }
+  const maxDecimals = Math.max(0, 6 - szDecimals);
   const sigFigs = Number(price.toPrecision(5));
   const str = sigFigs.toString();
   const dot = str.indexOf('.');
-  // Hyperliquid rejects prices with more than 6 decimal places
-  if (dot !== -1 && str.length - dot - 1 > 6) {
-    return sigFigs.toFixed(6);
+  if (dot !== -1 && str.length - dot - 1 > maxDecimals) {
+    return sigFigs.toFixed(maxDecimals);
   }
   return str;
 }
@@ -495,6 +523,79 @@ function saveState(state: ScannerState): void {
 function loadTradeLog(): TradeLog {
   try { return JSON.parse(fs.readFileSync(TRADE_LOG_FILE, 'utf-8')); }
   catch { return { trades: [] }; }
+}
+
+// Excursion columns for a closing trade. The candle fetch is best-effort: if it fails
+// the true* fields are null and the scan-sampled ones still land, so a network blip
+// degrades the record rather than losing it.
+async function excursionFields(t: PositionEntry, closeTime: number) {
+  const e = t.entryPrice;
+  const long = t.direction === 'long';
+  const pct = (p?: number): number | null =>
+    e && p ? (long ? (p - e) / e : (e - p) / e) : null;
+  const out = {
+    armed: !!t.trailingActive,
+    slPct: t.slPct,
+    mfeScanPct: pct(t.peakPrice),
+    maeScanPct: pct(t.troughPrice),
+    mfeTruePct: null as number | null,
+    maeTruePct: null as number | null,
+  };
+  if (!e) return out;
+  try {
+    const cs: any[] = await hlPost({
+      type: 'candleSnapshot',
+      req: { coin: t.symbol, interval: '15m', startTime: t.openTime, endTime: closeTime },
+    });
+    if (Array.isArray(cs) && cs.length) {
+      const highs = cs.map(c => parseFloat(c.h));
+      const lows = cs.map(c => parseFloat(c.l));
+      out.mfeTruePct = pct(long ? Math.max(...highs) : Math.min(...lows));
+      out.maeTruePct = pct(long ? Math.min(...lows) : Math.max(...highs));
+    }
+  } catch { /* leave true* null; scan-sampled values are still recorded */ }
+  return out;
+}
+
+// --- Signal harness (see HARNESS-PREREG.md, frozen 2026-08-02T16:50:05Z) ---
+// One row per SCORED CANDIDATE per scan — the whole universe, not just gate-passers.
+// Logging only what clears score>=60 is what makes the gate itself untestable: trades
+// never taken have no outcome. The full range makes score a continuous predictor.
+//
+// NO forward prices are fetched here. Outcomes are computed later by
+// backfill_outcomes.ts from candles, which costs nothing at scan time and lets the
+// horizons be re-cut without re-collecting. That deferral has a hard 45-day deadline
+// (candle retention) which the backfill owns and monitors.
+//
+// Append-only JSONL: a crash mid-write costs one line, never the file.
+function logSignalRows(rows: SignalResult[], dry: boolean): void {
+  const ts = Date.now();
+  const lines = rows.map(r => JSON.stringify({
+    ts,
+    symbol: r.symbol,
+    direction: r.direction,
+    score: r.score,
+    rsi: r.rsi,
+    obvRising: !!r.signals.obv,
+    volumeBuildRatio: r.volumeBuildRatio,
+    vwapDistPct: r.vwap > 0 ? (r.lastClose - r.vwap) / r.vwap : null,
+    ma50: r.ma50,
+    ma200: r.ma200,
+    isCross: r.isCross,
+    oiUsd: r.oiUsd,
+    oiDeltaPct: r.oiDeltaPct,
+    funding: r.funding,
+    midPrice: r.midPrice,
+    szDecimals: r.szDecimals,
+    candleMovePct: r.candleMovePct,
+    dry,   // analysis MUST filter to dry=false; --dry-run rows are pipeline tests
+  })).join('\n');
+  try {
+    if (lines) fs.appendFileSync(SIGNALS_FILE, lines + '\n');
+  } catch (err: any) {
+    // Never let harness logging break a trading scan.
+    console.error(`SIGNAL_LOG | append failed: ${err.message}`);
+  }
 }
 
 function logTrade(entry: TradeLogEntry): void {
@@ -630,6 +731,53 @@ async function checkStalePositions(
   const remaining: PositionEntry[] = [];
   const mids: Record<string, string> = await hlPost({ type: 'allMids' });
 
+  // Regression guard for the whole symbol-casing class. allMids is keyed by the
+  // universe's canonical casing; a stored symbol that does not resolve yields
+  // midPrice 0, which silently disables the trailing stop and the reversal close
+  // while the position still looks tracked. Runs every scan, not just --dry-run.
+  for (const t of state.positions) {
+    if (mids[t.symbol] === undefined) {
+      const canonical = Object.keys(mids).find(k => k.toUpperCase() === t.symbol.toUpperCase());
+      console.error(
+        `SYMBOL_UNRESOLVED | "${t.symbol}" is not a key in allMids — midPrice resolves to 0 and this position's exits are disabled.` +
+        (canonical
+          ? ` Stored casing is wrong; canonical is "${canonical}". Fix the symbol in positions.json.`
+          : ` No canonical match — asset may be delisted. MANUAL ACTION: close it on Hyperliquid.`),
+      );
+    }
+  }
+
+  // --- Stop-liveness observation: DETECT AND LOG ONLY ---
+  // Places nothing, cancels nothing, closes nothing. STRK and OP would have been
+  // flagged here on day one instead of sitting 42 and 39 days unprotected.
+  //
+  // Logs the COUNT and the trigger prices, not just pass/fail, because the open
+  // question is whether stale stops ACCUMULATE when the trail moves. `isPositionTpsl`
+  // is false on these orders, so Hyperliquid treats each placement as independent and
+  // the cancel that should clear the old one currently no-ops (it filters on
+  // `orderType`, which `info.openOrders()` does not return). That stacking is inferred,
+  // not observed — no open position has trailed yet. As these positions trail, the
+  // counts below answer it directly, and only then is it safe to write a re-placement
+  // rule. NOTE: the broken cancel filters are deliberately left alone for now — fixing
+  // them would halt the very accumulation this is here to measure.
+  try {
+    const frontOrders: any[] = await hlPost({ type: 'frontendOpenOrders', user: masterAddress });
+    for (const t of state.positions) {
+      const stops = frontOrders.filter(o =>
+        o.coin?.toUpperCase() === t.symbol.toUpperCase() && o.isTrigger && o.reduceOnly,
+      );
+      if (stops.length === 0) {
+        console.error(`STOP_MISSING | ${t.symbol} | no protective stop resting on the exchange — position is UNPROTECTED. (detect-only: nothing re-placed)`);
+      } else {
+        console.log(`STOP_LIVENESS | ${t.symbol} | count=${stops.length} | triggers=[${stops.map(o => o.triggerPx).join(', ')}]`);
+      }
+    }
+  } catch (err: any) {
+    // A failed call must never be read as "every position is unprotected" — that is an
+    // infrastructure signal, not N simultaneous emergencies. Draw no conclusion.
+    console.error(`STOP_LIVENESS | check unavailable this scan (${err.message}) — no conclusion drawn`);
+  }
+
   for (const tracked of state.positions) {
     try {
       const pos = openMap.get(tracked.symbol.toUpperCase());
@@ -650,7 +798,7 @@ async function checkStalePositions(
         // Distinguish between trailing stop (profit) and fixed SL (loss) based on P&L
         const exitType = realizedPnl !== null && realizedPnl > 0 ? 'trailing_stop' : 'fixed_sl';
         const exitLabel = exitType === 'trailing_stop' ? 'TRAILING_STOP' : 'FIXED_SL';
-        console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=${exitLabel} | PnL=${realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown'} | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'} | entryScore=${tracked.entryScore ?? '?'}`);
+        console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=${exitLabel} | PnL=${realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown'} | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice, tracked.szDecimals) : '?'} | entryScore=${tracked.entryScore ?? '?'}`);
 
         // On FIXED_SL (loss): block re-entry on this symbol for 48h
         if (exitType === 'fixed_sl') {
@@ -659,7 +807,7 @@ async function checkStalePositions(
           state.slCooldowns[tracked.symbol.toUpperCase()] = cooldownUntil;
           console.log(`  SL_BLOCK | ${tracked.symbol} blocked for 48h (until ${new Date(cooldownUntil).toISOString()})`);
         }
-        logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: exitType, pnlUsd: realizedPnl, entrySignal: tracked.entrySignal ?? 'unknown', entryScore: tracked.entryScore });
+        logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: exitType, pnlUsd: realizedPnl, entrySignal: tracked.entrySignal ?? 'unknown', entryScore: tracked.entryScore, ...(await excursionFields(tracked, Date.now())) });
         const heldH = ((Date.now() - tracked.openTime) / 3_600_000).toFixed(1);
         const slPnlStr = realizedPnl !== null ? `$${realizedPnl.toFixed(4)}` : 'unknown';
         const isTrailingStop = realizedPnl !== null && realizedPnl > 0;
@@ -691,7 +839,7 @@ async function checkStalePositions(
         const reversalScore = await getReversalScore(tracked.symbol, oppositeDir);
         if (reversalScore > tracked.entryScore + MIN_REVERSAL_SCORE_GAP) {
           const unrealizedPnl = parseFloat((pos as any).unrealizedPnl ?? '0');
-          console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=signal_reversal | PnL=$${unrealizedPnl.toFixed(4)} | entryScore=${tracked.entryScore} | reversalScore=${reversalScore} (${oppositeDir}) | held=${ageH}h | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'}`);
+          console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=signal_reversal | PnL=$${unrealizedPnl.toFixed(4)} | entryScore=${tracked.entryScore} | reversalScore=${reversalScore} (${oppositeDir}) | held=${ageH}h | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice, tracked.szDecimals) : '?'}`);
           const revTitle = `Closed ${tracked.symbol} ${tracked.direction} — ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Signal reversal`;
           const revTemplate = `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — Signal reversal** | PnL: ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Held: ${ageH}h | Reversal score: ${reversalScore} vs entry: ${tracked.entryScore}`;
           const revPrompt = `You are a crypto perp trader posting a trade close on a forum. Write 2-3 natural sentences about this signal reversal exit. Be honest and brief.\n\nTrade: ${tracked.direction.toUpperCase()} ${tracked.symbol} | PnL: ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Held: ${ageH}h | Entry score: ${tracked.entryScore}/100 | Opposing ${oppositeDir} signal scored ${reversalScore} — momentum reversed.`;
@@ -721,13 +869,13 @@ async function checkStalePositions(
             console.error(`  ${tracked.symbol}: mid price unavailable — skipping reversal close, will retry`);
             remaining.push(tracked);
           } else {
-            const closePrice = formatPrice(midPrice * (isLong ? 0.99 : 1.01));
+            const closePrice = formatPrice(midPrice * (isLong ? 0.99 : 1.01), tracked.szDecimals);
             const result = await exchange.order({
               orders: [{ a: tracked.assetIndex, b: !isLong, r: true, p: closePrice, s: sz, t: { limit: { tif: 'Ioc' } } }],
               grouping: 'na',
             });
             if (extractFilledOrder(result)) {
-              logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: 'signal_reversal', pnlUsd: unrealizedPnl, entrySignal: tracked.entrySignal ?? 'unknown', entryScore: tracked.entryScore });
+              logTrade({ symbol: tracked.symbol, direction: tracked.direction, openTime: tracked.openTime, closeTime: Date.now(), closeReason: 'signal_reversal', pnlUsd: unrealizedPnl, entrySignal: tracked.entrySignal ?? 'unknown', entryScore: tracked.entryScore, ...(await excursionFields(tracked, Date.now())) });
             } else {
               console.error(`  ${tracked.symbol}: reversal close did not fill — keeping in state, will retry`);
               remaining.push(tracked);
@@ -748,11 +896,15 @@ async function checkStalePositions(
         if (midPrice && tracked.entryPrice && tracked.slPct) {
           const slDistance = tracked.entryPrice * tracked.slPct;
 
-          // Track peak (best price reached in our direction)
+          // Track peak (best price reached in our direction) and trough (worst).
+          // Both are sampled at scan cadence, so they UNDERSTATE the true excursion —
+          // that understatement is the point: it is what the system could have acted on.
           if (isLong) {
-            tracked.peakPrice = Math.max(tracked.peakPrice ?? tracked.entryPrice, midPrice);
+            tracked.peakPrice   = Math.max(tracked.peakPrice ?? tracked.entryPrice, midPrice);
+            tracked.troughPrice = Math.min(tracked.troughPrice ?? tracked.entryPrice, midPrice);
           } else {
-            tracked.peakPrice = Math.min(tracked.peakPrice ?? tracked.entryPrice, midPrice);
+            tracked.peakPrice   = Math.min(tracked.peakPrice ?? tracked.entryPrice, midPrice);
+            tracked.troughPrice = Math.max(tracked.troughPrice ?? tracked.entryPrice, midPrice);
           }
 
           // Activate trailing once price moves >= 1R in our favour
@@ -795,14 +947,14 @@ async function checkStalePositions(
               await sleep(500);
 
               const sz = Math.abs(parseFloat(pos.szi)).toString();
-              const newSlFormatted = formatPrice(newSlPrice);
+              const newSlFormatted = formatPrice(newSlPrice, tracked.szDecimals);
               const slResult = await exchange.order({
                 orders: [{ a: tracked.assetIndex, b: !isLong, r: true, p: newSlFormatted, s: sz, t: { trigger: { triggerPx: newSlFormatted, isMarket: true, tpsl: 'sl' } } }],
                 grouping: 'na',
               });
 
               if (hasOrderStatuses(slResult)) {
-                console.log(`TRAIL | ${tracked.symbol} ${tracked.direction.toUpperCase()} | SL moved → ${newSlFormatted} | peak=${formatPrice(tracked.peakPrice!)} | locked=${((Math.abs(tracked.peakPrice! - tracked.entryPrice!) / tracked.entryPrice!) * 100 / 2).toFixed(1)}% | PnL=$${unrealizedPnl.toFixed(4)}`);
+                console.log(`TRAIL | ${tracked.symbol} ${tracked.direction.toUpperCase()} | SL moved → ${newSlFormatted} | peak=${formatPrice(tracked.peakPrice!, tracked.szDecimals)} | locked=${((Math.abs(tracked.peakPrice! - tracked.entryPrice!) / tracked.entryPrice!) * 100 / 2).toFixed(1)}% | PnL=$${unrealizedPnl.toFixed(4)}`);
                 tracked.slPrice = newSlPrice;
               } else {
                 console.error(`${tracked.symbol}: trailing SL order failed — keeping old SL`);
@@ -811,11 +963,11 @@ async function checkStalePositions(
           }
 
           const trailStatus = tracked.trailingActive
-            ? `trailing SL @ ${tracked.slPrice ? formatPrice(tracked.slPrice) : '?'}`
+            ? `trailing SL @ ${tracked.slPrice ? formatPrice(tracked.slPrice, tracked.szDecimals) : '?'}`
             : `waiting 1R (+${(slDistance / tracked.entryPrice * 100).toFixed(1)}%)`;
           console.log(`${tracked.symbol}: ${ageH}h | PnL $${unrealizedPnl.toFixed(2)} | ${trailStatus}`);
         } else {
-          console.log(`${tracked.symbol}: ${ageH}h | PnL $${unrealizedPnl.toFixed(2)} | no entry data (pre-upgrade position)`);
+          console.error(`UNMANAGED | ${tracked.symbol}: ${ageH}h | PnL $${unrealizedPnl.toFixed(2)} | adopted without entry data — no trailing stop, no reversal exit, NO EXIT PATH AT ALL. MANUAL ACTION: close it on Hyperliquid.`);
         }
 
         remaining.push(tracked);
@@ -874,25 +1026,47 @@ async function main() {
   const openPositions = (state.assetPositions as any[]).filter(p => parseFloat(p.position.szi) !== 0);
   if (!dryRun) {
     const [meta]: [any, any[]] = await hlPost({ type: 'metaAndAssetCtxs' });
-    const assetMap = new Map<string, { index: number; szDecimals: number }>();
-    for (let i = 0; i < meta.universe.length; i++) assetMap.set(meta.universe[i].name.toUpperCase(), { index: i, szDecimals: meta.universe[i].szDecimals });
+    // `name` is carried so an adopted position stores the universe's CANONICAL casing.
+    // Seven perps are not all-uppercase (kBONK, kDOGS, kFLOKI, kLUNC, kNEIRO, kPEPE,
+    // kSHIB). Storing an uppercased symbol silently disables every exit path for them:
+    // mids[symbol] misses -> midPrice 0 -> trailing stop guard fails; and
+    // candleSnapshot({coin:"KBONK"}) 500s -> getReversalScore returns 0 -> reversal
+    // exit never fires. Map keys and comparisons stay uppercase — every comparison site
+    // uppercases both sides independently, so canonical storage breaks none of them.
+    const assetMap = new Map<string, { index: number; szDecimals: number; name: string }>();
+    for (let i = 0; i < meta.universe.length; i++) assetMap.set(meta.universe[i].name.toUpperCase(), { index: i, szDecimals: meta.universe[i].szDecimals, name: meta.universe[i].name });
     const stateCoins = new Set(scanState.positions.map(p => p.symbol.toUpperCase()));
     for (const ap of openPositions) {
-      const coin = ap.position.coin.toUpperCase();
-      if (!stateCoins.has(coin)) {
-        const asset = assetMap.get(coin);
+      const coinKey = ap.position.coin.toUpperCase();
+      if (!stateCoins.has(coinKey)) {
+        const asset = assetMap.get(coinKey);
         const dir = parseFloat(ap.position.szi) > 0 ? 'long' : 'short';
-        console.log(`Auto-sync: ${coin} found on-chain but missing from state — adding`);
-        scanState.positions.push({ symbol: coin, direction: dir, openTime: Date.now(), assetIndex: asset?.index ?? -1, szDecimals: asset?.szDecimals ?? 0 });
+        // Never adopt with sentinels. assetIndex -1 makes every subsequent order for
+        // this position fail, and szDecimals 0 silently reinstates the formatPrice
+        // decimal bug in data, where the compiler cannot see it. Skip loudly instead:
+        // the position stays out of state, so auto-sync re-detects and re-logs it on
+        // every scan rather than being tracked-but-unmanageable or silently dropped.
+        if (!asset) {
+          console.error(`ADOPT_FAIL | ${ap.position.coin} is open on-chain but absent from the asset universe — NOT adopted. No valid assetIndex/szDecimals exists, so it cannot be managed. MANUAL ACTION: close it on Hyperliquid.`);
+          continue;
+        }
+        console.log(`Auto-sync: ${asset.name} found on-chain but missing from state — adding`);
+        scanState.positions.push({ symbol: asset.name, direction: dir, openTime: Date.now(), assetIndex: asset.index, szDecimals: asset.szDecimals });
       }
     }
     saveState(scanState);
   }
   const openCoins = new Set(openPositions.map((p: any) => p.position.coin.toUpperCase()));
-  if (!dryRun && openPositions.length >= MAX_POSITIONS) {
+  // At capacity we still SCORE the whole universe — we just take no entries.
+  // Returning here previously skipped scoring entirely on 97.4% of runs (7531 of 7731),
+  // which starved the signal harness of the timestamps its inference depends on
+  // (10.5/day vs 96/day — see HARNESS-PREREG.md amendment A1). Trading is unaffected:
+  // slotsAvailable is 0 when full, so `eligible.slice(0, 0)` is empty, and the guard at
+  // the order loop enforces that rather than leaving it to arithmetic elsewhere.
+  const atCapacity = !dryRun && openPositions.length >= MAX_POSITIONS;
+  if (atCapacity) {
     const coins = openPositions.map((p: any) => p.position.coin).join(', ');
-    console.log(`At max positions (${MAX_POSITIONS}): ${coins} — skipping scan`);
-    return;
+    console.log(`At max positions (${MAX_POSITIONS}): ${coins} — scoring for harness, no entries will be taken`);
   }
   if (paperEntry) console.log(`[PAPER ENTRY] Scanning and simulating fills without placing live orders...`);
   else if (dryRun) console.log(`[DRY RUN] Scanning regardless of position count...`);
@@ -939,6 +1113,9 @@ async function main() {
 
   // Persist OI snapshots so delta is available next scan
   saveState(scanState);
+
+  // Harness: record the FULL scored universe before any gate or slot limit is applied.
+  logSignalRows(allResults, dryRun);
 
   // Sort: highest continuous score first; smallest candle move as tiebreaker (freshest entry)
   allResults.sort((a, b) => {
@@ -1050,6 +1227,15 @@ async function main() {
   else console.log(`\nOpening ${toTrade.length} new position(s)...`);
 
   for (const best of toTrade) {
+    // Local enforcement of the capacity invariant. `toTrade` is already empty when full
+    // (slotsAvailable = 0), so this is unreachable by construction — which is exactly why
+    // it exists: that construction lives hundreds of lines away in the slot arithmetic,
+    // and a future edit there would otherwise let a scan at capacity place an order
+    // silently. If this ever fires, the invariant broke and you want to know immediately.
+    if (!dryRun && openPositions.length >= MAX_POSITIONS) {
+      console.error(`ORDER_BLOCKED | refused to open ${best.symbol} ${best.direction}: already at ${openPositions.length}/${MAX_POSITIONS} positions. This path should be unreachable — the slot arithmetic has broken.`);
+      break;
+    }
     const isLong = best.direction === 'long';
     const estimatedEntryPrice = best.midPrice;
     const estimatedDynamicSlDistance = Math.abs(estimatedEntryPrice - best.slPrice);
@@ -1062,7 +1248,7 @@ async function main() {
 
     const requestedSz = formatSize(MARGIN_PER_TRADE_USD * best.leverage, estimatedEntryPrice, best.szDecimals);
     const slippage = isLong ? 1.01 : 0.99;
-    const orderPrice = formatPrice(estimatedEntryPrice * slippage);
+    const orderPrice = formatPrice(estimatedEntryPrice * slippage, best.szDecimals);
 
     console.log(`\nOpening ${best.direction.toUpperCase()} ${best.symbol}`);
     console.log(`  Margin: $${MARGIN_PER_TRADE_USD} | ${best.leverage}x leverage | $${MARGIN_PER_TRADE_USD * best.leverage} notional | OI: $${(best.oiUsd / 1e6).toFixed(1)}M | Estimated entry: ~${estimatedEntryPrice}`);
@@ -1095,7 +1281,7 @@ async function main() {
         console.log(`  ${best.symbol}: real fill moved SL to ${(dynamicSlPct * 100).toFixed(1)}% away — ${paperEntry ? 'would close immediately' : 'closing immediately'}`);
 
         if (!paperEntry) {
-          const closePrice = formatPrice(entryPrice * (isLong ? 0.99 : 1.01));
+          const closePrice = formatPrice(entryPrice * (isLong ? 0.99 : 1.01), best.szDecimals);
           const closeResult = await exchange.order({
             orders: [{ a: best.assetIndex, b: !isLong, r: true, p: closePrice, s: sz, t: { limit: { tif: 'Ioc' } } }],
             grouping: 'na',
@@ -1107,7 +1293,7 @@ async function main() {
 
       const slPct = Math.max(dynamicSlPct, MIN_SL_PCT);
       const slDistance = entryPrice * slPct;
-      const slPrice = formatPrice(isLong ? entryPrice - slDistance : entryPrice + slDistance);
+      const slPrice = formatPrice(isLong ? entryPrice - slDistance : entryPrice + slDistance, best.szDecimals);
 
       if (dynamicSlPct < MIN_SL_PCT) {
         console.log(`  Dynamic SL was ${(dynamicSlPct * 100).toFixed(1)}% away from real fill — widened to minimum ${(MIN_SL_PCT * 100).toFixed(1)}%`);
@@ -1149,7 +1335,7 @@ async function main() {
           // Ignore cleanup failures and still attempt a marketable close
         }
 
-        const closePrice = formatPrice(entryPrice * (isLong ? 0.99 : 1.01));
+        const closePrice = formatPrice(entryPrice * (isLong ? 0.99 : 1.01), best.szDecimals);
         const closeResult = await exchange.order({
           orders: [{ a: best.assetIndex, b: !isLong, r: true, p: closePrice, s: sz, t: { limit: { tif: 'Ioc' } } }],
           grouping: 'na',
