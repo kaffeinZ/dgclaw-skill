@@ -840,13 +840,28 @@ async function checkStalePositions(
         const exitTypeLabel = isTrailingStop ? 'Trailing stop locked' : 'Stop Loss hit';
         const slTitle = `Closed ${tracked.symbol} ${tracked.direction} — ${realizedPnl !== null && realizedPnl >= 0 ? '+' : ''}${slPnlStr} | ${exitTypeLabel}`;
         const slTemplate = `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — ${exitTypeLabel}** | PnL: ${slPnlStr} | Held: ${heldH}h | Entry score: ${tracked.entryScore ?? '?'}/100`;
-        const slPrompt = `You are a crypto perp trader posting a trade close on a forum. Write 2-3 natural sentences about this ${isTrailingStop ? 'trailing stop' : 'stop loss'} exit. Be honest and brief.\n\nTrade: ${tracked.direction.toUpperCase()} ${tracked.symbol} | PnL: ${slPnlStr} | Held: ${heldH}h | Entry score: ${tracked.entryScore ?? '?'}/100 | ${isTrailingStop ? 'Trailing stop locked profit.' : 'Stop loss triggered.'}`;
+        // Excursion facts. Null for anything closed before the MFE/MAE instrumentation
+        // (2026-08-06) — say "not recorded" explicitly rather than omitting the line,
+        // so the model cannot quietly fill the gap with a plausible number.
+        const mfeStr = tracked.entryPrice && tracked.peakPrice
+          ? `${(((tracked.direction === 'long' ? tracked.peakPrice - tracked.entryPrice : tracked.entryPrice - tracked.peakPrice) / tracked.entryPrice) * 100).toFixed(1)}%`
+          : 'not recorded';
+        const targetStr = tracked.slPct ? `${(tracked.slPct * 100).toFixed(1)}%` : 'not recorded';
+        const slFacts = `- Asset: ${tracked.symbol}\n- Direction: ${tracked.direction}\n- Result: ${slPnlStr}\n- Held: ${heldH} hours\n- Entry score: ${tracked.entryScore ?? 'not recorded'} out of 100\n- Best it ever reached in our favour: ${mfeStr}\n- Move needed to arm the trailing stop: ${targetStr}\n- Trailing stop had armed: ${tracked.trailingActive ? 'yes' : 'no'}`;
+        const slAngle = isTrailingStop
+          ? 'The trailing stop closed this in profit. Say what the trail actually captured. Do not claim the entry was skilful — the exit did the work.'
+          : (mfeStr !== 'not recorded' && targetStr !== 'not recorded'
+            ? 'This hit the stop. Compare how far it ever got in our favour against the move it needed. If it never came close, say plainly that the entry was wrong from the open rather than a good trade mishandled on the way out.'
+            : 'This hit the stop. Be plain about it and do not speculate about why beyond the figures given.');
+        const slPrompt = `You are a systematic trading bot reporting one closed position to a public forum. Write 2-3 plain sentences.\n\nHARD RULE: use ONLY figures that appear in FACTS below. Never calculate, estimate, round-trip or introduce any number that is not listed. Where a field says "not recorded", either say it was not recorded or leave it out — never supply a value for it.\n\nNo hype, no emoji, no price predictions, no claiming an edge. A reader should learn something true about this trade.\n\n${slAngle}\n\nFACTS:\n${slFacts}`;
         console.log(`LLM_PROMPT | SL exit | symbol=${tracked.symbol} | PnL=${slPnlStr} | prompt_length=${slPrompt.length}`);
         try {
           const aiContent = await generatePostContent(slPrompt);
           console.log(`LLM_RESPONSE | ${aiContent ? `${aiContent.substring(0, 60)}...` : 'null'}`);
+          // Every figure fed into the prompt must also be permitted by the validator,
+          // or the post is rejected for quoting a number we ourselves supplied.
           const slAllowed = [realizedPnl ?? NaN, parseFloat(heldH), tracked.entryScore ?? NaN,
-            tracked.slPct != null ? tracked.slPct * 100 : NaN];
+            tracked.slPct != null ? tracked.slPct * 100 : NaN, parseFloat(mfeStr)];
           const slCheck = aiContent ? validateNumbers(aiContent, slAllowed) : { ok: false };
           const aiResponse = aiContent && slCheck.ok ? aiContent : slTemplate;
           console.log(`FORUM_POST | used=${aiContent && slCheck.ok ? 'AI' : 'TEMPLATE'}${!slCheck.ok && slCheck.offender !== undefined ? ` | rejected_number=${slCheck.offender}` : ''}`);
@@ -871,7 +886,7 @@ async function checkStalePositions(
           console.log(`EXIT | ${tracked.symbol} ${tracked.direction.toUpperCase()} | reason=signal_reversal | PnL=$${unrealizedPnl.toFixed(4)} | entryScore=${tracked.entryScore} | reversalScore=${reversalScore} (${oppositeDir}) | held=${ageH}h | entry=${tracked.entryPrice ?? '?'} | SL=${tracked.slPrice ? formatPrice(tracked.slPrice, tracked.szDecimals) : '?'}`);
           const revTitle = `Closed ${tracked.symbol} ${tracked.direction} — ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Signal reversal`;
           const revTemplate = `**${tracked.symbol} ${tracked.direction.toUpperCase()} closed — Signal reversal** | PnL: ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Held: ${ageH}h | Reversal score: ${reversalScore} vs entry: ${tracked.entryScore}`;
-          const revPrompt = `You are a crypto perp trader posting a trade close on a forum. Write 2-3 natural sentences about this signal reversal exit. Be honest and brief.\n\nTrade: ${tracked.direction.toUpperCase()} ${tracked.symbol} | PnL: ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)} | Held: ${ageH}h | Entry score: ${tracked.entryScore}/100 | Opposing ${oppositeDir} signal scored ${reversalScore} — momentum reversed.`;
+          const revPrompt = `You are a systematic trading bot reporting one closed position to a public forum. Write 2-3 plain sentences.\n\nHARD RULE: use ONLY figures that appear in FACTS below. Never calculate, estimate or introduce any number that is not listed.\n\nNo hype, no emoji, no price predictions. This position was closed early because an opposing signal outscored the one that opened it — explain that mechanically. Note that being right to exit is not the same as the entry having been good.\n\nFACTS:\n- Asset: ${tracked.symbol}\n- Direction: ${tracked.direction}\n- Result: ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(4)}\n- Held: ${ageH} hours\n- Score that opened it: ${tracked.entryScore}\n- Opposing ${oppositeDir} signal now scores: ${reversalScore}`;
           try {
             const aiContent = await generatePostContent(revPrompt);
             const revPnLStr = unrealizedPnl >= 0 ? `+$${unrealizedPnl.toFixed(4)}` : `-$${Math.abs(unrealizedPnl).toFixed(4)}`;
@@ -1386,7 +1401,12 @@ async function main() {
       const crossNote = best.isCross ? `\n- **Golden/Death Cross**: yes — priority entry, overrides normal gates` : '';
       const entryTitle = `${best.direction === 'long' ? 'Long' : 'Short'} ${best.symbol} — Score ${best.score}/100 | RSI ${best.rsi.toFixed(1)} | Vol ${best.volumeBuildRatio.toFixed(2)}×`;
       const entryTemplate = `**${best.direction.toUpperCase()} ${best.symbol}** | Score: ${best.score}/100 | Entry: ${entryPrice} | SL: ${slPrice} (${(slPct * 100).toFixed(1)}%)\nRSI: ${best.rsi.toFixed(1)} | Vol: ${best.volumeBuildRatio.toFixed(2)}× | VWAP: ${vwapDesc} | Trend: ${maDesc}\nSignals: ${signalList}${crossNote}`;
-      const entryPrompt = `You are a crypto perp trader posting a signal on a trading forum. Write a natural 3-4 sentence trading rationale. Start the first sentence with "${best.direction.toUpperCase()} ${best.symbol}" — always include the token name and direction. Be concise and confident, like a real trader — not robotic.\n\nTrade data:\n- ${best.direction.toUpperCase()} ${best.symbol}\n- Score: ${best.score}/100\n- RSI: ${best.rsi.toFixed(1)}\n- Volume build: ${best.volumeBuildRatio.toFixed(2)}× (recent vs prior candles)\n- Price vs VWAP: ${vwapDesc}\n- Trend: ${maDesc}\n- Signals fired: ${signalList}${best.isCross ? '\n- Golden/Death Cross fired — priority entry' : ''}\n- Entry: ${entryPrice} | SL: ${slPrice} (${(slPct * 100).toFixed(1)}% away)`;
+      // "Be concise and confident, like a real trader" was the line doing most of the work
+      // in producing 124 interchangeable hype posts. Replaced with the opposite instruction:
+      // state what fired and what it does not establish. The bot's own measurements say its
+      // entry signal is indistinguishable from a coin flip, so a confident rationale would
+      // be a claim the data does not support.
+      const entryPrompt = `You are a systematic trading bot announcing one new position on a public forum. Write 3-4 plain sentences.\n\nHARD RULE: use ONLY figures that appear in FACTS below. Never calculate, estimate or introduce any number that is not listed — no targets, no projected returns, no percentages you were not given.\n\nStart with "${best.direction.toUpperCase()} ${best.symbol}". State which conditions triggered this and what the stop is. Do NOT predict where price will go and do NOT express confidence in the outcome: these are threshold crossings, not a forecast. It is good writing here to note what the signal does not tell you.\n\nNo hype, no emoji, no rocket language.\n\nFACTS:\n- ${best.direction.toUpperCase()} ${best.symbol}\n- Composite score: ${best.score} out of 100 (entry threshold is 60)\n- RSI: ${best.rsi.toFixed(1)}\n- Volume vs prior candles: ${best.volumeBuildRatio.toFixed(2)}x\n- Price vs VWAP: ${vwapDesc}\n- Trend: ${maDesc}\n- Conditions that fired: ${signalList}${best.isCross ? '\n- Golden/Death cross fired, which bypasses the usual score ranking' : ''}\n- Entry: ${entryPrice}\n- Stop loss: ${slPrice}, which is ${(slPct * 100).toFixed(1)}% away`;
       try {
         const aiContent = await generatePostContent(entryPrompt);
         // This path previously had NO validation at all — 124 posts published with
