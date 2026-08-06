@@ -67,7 +67,9 @@ const SIGNALS_FILE = new URL('../signals.jsonl', import.meta.url).pathname;
 
 const FORUM_BASE = 'https://degen.virtuals.io';
 const FORUM_AGENT_ID = '1026';
-const FORUM_SIGNALS_THREAD = '1023';
+// 1023 is the PUBLIC 'Discussion' thread (verified via API 2026-08-06). 1024 is 'Alphas' and
+// is GATED. The old name claimed this was the signals thread; it never was.
+const FORUM_THREAD_DISCUSSION = '1023';
 
 const MAJORS = new Set([
   'BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'LTC',
@@ -631,11 +633,35 @@ async function generatePostContent(prompt: string): Promise<string | null> {
   }
 }
 
-function validatePnL(aiContent: string, expectedPnL: string): boolean {
-  // Ensure AI response mentions the actual PnL (not hallucinated numbers)
-  // Look for the PnL value (e.g., "$12.15", "-$6.07", "+$12.15")
-  const cleanPnL = expectedPnL.replace('$', '').replace('+', '').trim();
-  return aiContent.includes(cleanPnL);
+// Every number a generated post is allowed to contain. The LLM is told not to invent
+// statistics, but a prompt is a request and this is the guarantee: any figure appearing
+// in the prose must match a value the code computed, or the post is rejected.
+//
+// This replaces validatePnL, which required the exact 4-decimal literal ("-3.0192") and
+// therefore rejected 91 of 91 generations — an LLM writes "-$3" or "-$3.02" like a person.
+// An audit of 124 already-published entry posts found 72 RSI claims exact, 9 rounded to
+// <=0.5, and ZERO off by more than 2: the model rounds, it does not fabricate. So the old
+// check was mis-calibrated, not too weak. Tolerance is what makes it usable; applying it
+// to the entry path (which had NO validation at all) is what makes it a guarantee.
+const STRUCTURAL_NUMBERS = [0, 1, 2, 3, 4, 5, 10, 50, 100, 200];  // "MA50", "MA200", "2-3 sentences"
+
+function validateNumbers(aiContent: string, allowed: number[]): { ok: boolean; offender?: number } {
+  const allow = [...allowed.filter(Number.isFinite), ...STRUCTURAL_NUMBERS];
+  // A single absolute tolerance cannot serve both an RSI (~50) and a price (~0.02): any
+  // floor loose enough for the first makes the second unverifiable. So model the actual
+  // behaviour instead — the LLM ROUNDS. Accept a figure if it is within 5%, or if it
+  // equals the real value rounded to any decimal place.
+  const matchesRounded = (n: number, A: number) =>
+    [0, 1, 2, 3, 4, 5, 6].some(d => Math.abs(n - Number(A.toFixed(d))) < 1e-9);
+  const found = [...aiContent.matchAll(/-?\d+(?:\.\d+)?/g)].map(m => Math.abs(parseFloat(m[0])));
+  for (const n of found) {
+    const ok = allow.some(a => {
+      const A = Math.abs(a);
+      return Math.abs(n - A) <= A * 0.05 || matchesRounded(n, A);
+    });
+    if (!ok) return { ok: false, offender: n };
+  }
+  return { ok: true };
 }
 
 async function postToForum(title: string, content: string): Promise<void> {
@@ -645,7 +671,7 @@ async function postToForum(title: string, content: string): Promise<void> {
     return;
   }
   try {
-    const res = await fetch(`${FORUM_BASE}/api/forums/${FORUM_AGENT_ID}/threads/${FORUM_SIGNALS_THREAD}/posts`, {
+    const res = await fetch(`${FORUM_BASE}/api/forums/${FORUM_AGENT_ID}/threads/${FORUM_THREAD_DISCUSSION}/posts`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
       body: JSON.stringify({ title, content }),
@@ -819,8 +845,11 @@ async function checkStalePositions(
         try {
           const aiContent = await generatePostContent(slPrompt);
           console.log(`LLM_RESPONSE | ${aiContent ? `${aiContent.substring(0, 60)}...` : 'null'}`);
-          const aiResponse = aiContent && validatePnL(aiContent, slPnlStr) ? aiContent : slTemplate;
-          console.log(`FORUM_POST | used=${aiContent && validatePnL(aiContent, slPnlStr) ? 'AI' : 'TEMPLATE'}`);
+          const slAllowed = [realizedPnl ?? NaN, parseFloat(heldH), tracked.entryScore ?? NaN,
+            tracked.slPct != null ? tracked.slPct * 100 : NaN];
+          const slCheck = aiContent ? validateNumbers(aiContent, slAllowed) : { ok: false };
+          const aiResponse = aiContent && slCheck.ok ? aiContent : slTemplate;
+          console.log(`FORUM_POST | used=${aiContent && slCheck.ok ? 'AI' : 'TEMPLATE'}${!slCheck.ok && slCheck.offender !== undefined ? ` | rejected_number=${slCheck.offender}` : ''}`);
           await postToForum(slTitle, aiResponse);
         } catch {
           await postToForum(slTitle, slTemplate).catch(() => {});
@@ -846,7 +875,10 @@ async function checkStalePositions(
           try {
             const aiContent = await generatePostContent(revPrompt);
             const revPnLStr = unrealizedPnl >= 0 ? `+$${unrealizedPnl.toFixed(4)}` : `-$${Math.abs(unrealizedPnl).toFixed(4)}`;
-            const aiResponse = aiContent && validatePnL(aiContent, revPnLStr) ? aiContent : revTemplate;
+            const revAllowed = [unrealizedPnl, parseFloat(ageH), reversalScore, tracked.entryScore ?? NaN];
+            const revCheck = aiContent ? validateNumbers(aiContent, revAllowed) : { ok: false };
+            if (aiContent && !revCheck.ok) console.log(`FORUM_POST | used=TEMPLATE | rejected_number=${revCheck.offender}`);
+            const aiResponse = aiContent && revCheck.ok ? aiContent : revTemplate;
             await postToForum(revTitle, aiResponse);
           } catch {
             await postToForum(revTitle, revTemplate).catch(() => {});
@@ -1357,7 +1389,15 @@ async function main() {
       const entryPrompt = `You are a crypto perp trader posting a signal on a trading forum. Write a natural 3-4 sentence trading rationale. Start the first sentence with "${best.direction.toUpperCase()} ${best.symbol}" — always include the token name and direction. Be concise and confident, like a real trader — not robotic.\n\nTrade data:\n- ${best.direction.toUpperCase()} ${best.symbol}\n- Score: ${best.score}/100\n- RSI: ${best.rsi.toFixed(1)}\n- Volume build: ${best.volumeBuildRatio.toFixed(2)}× (recent vs prior candles)\n- Price vs VWAP: ${vwapDesc}\n- Trend: ${maDesc}\n- Signals fired: ${signalList}${best.isCross ? '\n- Golden/Death Cross fired — priority entry' : ''}\n- Entry: ${entryPrice} | SL: ${slPrice} (${(slPct * 100).toFixed(1)}% away)`;
       try {
         const aiContent = await generatePostContent(entryPrompt);
-        await postToForum(entryTitle, aiContent ?? entryTemplate);
+        // This path previously had NO validation at all — 124 posts published with
+        // LLM-written figures that nothing checked. An audit found no fabrication, but
+        // that was luck, not a guarantee. Same validator as the exit paths now.
+        const entryAllowed = [best.score, best.rsi, best.volumeBuildRatio, entryPrice,
+          parseFloat(slPrice), slPct * 100, best.ma50 ?? NaN, best.ma200 ?? NaN,
+          best.vwap > 0 ? (best.lastClose - best.vwap) / best.vwap * 100 : NaN];
+        const entryCheck = aiContent ? validateNumbers(aiContent, entryAllowed) : { ok: false };
+        console.log(`FORUM_POST | entry | used=${aiContent && entryCheck.ok ? 'AI' : 'TEMPLATE'}${aiContent && !entryCheck.ok ? ` | rejected_number=${entryCheck.offender}` : ''}`);
+        await postToForum(entryTitle, aiContent && entryCheck.ok ? aiContent : entryTemplate);
       } catch {
         await postToForum(entryTitle, entryTemplate).catch(() => {});
       }
